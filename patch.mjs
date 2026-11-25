@@ -1,7 +1,11 @@
 #!/usr/bin/env node
-// dsh-whale-fence-patch —— 给已安装的 dsh-whale-widget 打信任栅栏兼容补丁。
+// dsh-whale-fence-patch —— 给已安装的 dsh-whale-widget 打两个上游 bug 的补丁。
 //
-// 只改 lib/index.js 里的两处：connectionFence() 与 rejected() 的栅栏分派。
+// 改 lib/index.js 里的四处：
+//   ① connectionFence()           —— 栅栏兼容（DSH >= 0.2.2-rc.2 的 admit）
+//   ② rejected() 的栅栏分派        —— 同上
+//   ③ root.inject 列表             —— 补 connection.authentication，否则 admit 恒抛
+//   ④ 音效路由的原型链查表          —— ?set=__proto__ 等键名导致 400（与栅栏无关的第二个 bug）
 // 不复制、不分发上游任何代码或素材；素材仍由用户已安装的上游副本提供。
 //
 // 用法：
@@ -83,10 +87,169 @@ const PATCHED_DISPATCH = `      let code
 const ORIGINAL_INJECT = `    root.inject(['webServer', 'credentials', 'connection'], (ctx) => {`
 const PATCHED_INJECT = `    root.inject(['webServer', 'credentials', 'connection', 'connection.authentication'], (ctx) => {`
 
+// 第四处：音效路由的原型链查表崩溃（第二个 bug，与栅栏无关）。
+// 症状：GET /dsh-whale/sound/{press,release}.mp3?set=__proto__（或 constructor /
+//   toString / valueOf / hasOwnProperty …）返回 400，响应头没有 Content-Type ——
+//   那是宿主 webserver 兜底 catch 写的，不是插件自己写的。
+// 根因：SOUND_SETS 是普通对象字面量，SOUND_SETS['__proto__'] 返回 Object.prototype、
+//   SOUND_SETS['constructor'] 返回 Function，两者都 truthy，于是 `|| SOUND_SETS.duck`
+//   的兜底不生效；随后 set.press 是 undefined，loadSound 里 for-of 抛
+//   TypeError: candidates is not iterable。
+// 修法：查表改走 Object.hasOwn（自定义音效组 group_xxx 也要走 ?set=，所以不能在
+//   soundSetFromUrl 里做白名单拒绝），并在 serveSound 里加 Array.isArray 第二道防线。
+
+const ORIGINAL_SOUND = `    function serveSound(req, res, candidates) {
+      const bytes = loadSound(candidates)
+      if (!bytes) {
+        // v752：404 也带 no-store。原来只有 200 分支有缓存头，失败的响应可能被浏览器/中间层
+        // 缓存住，一旦缓存就会变成"永久没声音、刷新也没用"。
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' })
+        res.end('sound unavailable')
+        return
+      }
+      res.writeHead(200, {
+        'Content-Type': 'audio/mpeg',
+        'Cache-Control': 'no-store',
+        'Content-Length': String(bytes.length),
+      })
+      res.end(bytes)
+    }
+
+    disposers.push(registerRoute({
+      kind: 'exact',
+      path: '/dsh-whale/sound/press.mp3',
+      handler: (req, res) => {
+        const set = SOUND_SETS[soundSetFromUrl(req.url)] || SOUND_SETS.duck
+        // 自定义音效组：set 为组 id 时按组内 press 片段取音频
+        const setName = soundSetFromUrl(req.url)
+        if (setName && !SOUND_SETS[setName]) {
+          const fragId = groupFragmentId(setName, 'press')
+          if (fragId === '') { res.writeHead(204, { 'Cache-Control': 'no-store' }); res.end(); return } // 留空槽：该事件静音（v752：补 no-store，空响应不允许被缓存）
+          const bytes = loadAudioFragmentBytes(fragId)
+          if (bytes) {
+            res.writeHead(200, {
+              'Content-Type': fragmentMime(fragId),
+              'Cache-Control': 'no-store',
+              'Content-Length': String(bytes.length),
+            })
+            res.end(bytes)
+            return
+          }
+        }
+        serveSound(req, res, set.press)
+      },
+    }))
+
+    disposers.push(registerRoute({
+      kind: 'exact',
+      path: '/dsh-whale/sound/release.mp3',
+      handler: (req, res) => {
+        const set = SOUND_SETS[soundSetFromUrl(req.url)] || SOUND_SETS.duck
+        const setName = soundSetFromUrl(req.url)
+        if (setName && !SOUND_SETS[setName]) {
+          const fragId = groupFragmentId(setName, 'release')
+          if (fragId === '') { res.writeHead(204, { 'Cache-Control': 'no-store' }); res.end(); return } // 留空槽：该事件静音（v752：补 no-store，空响应不允许被缓存）
+          const bytes = loadAudioFragmentBytes(fragId)
+          if (bytes) {
+            res.writeHead(200, {
+              'Content-Type': fragmentMime(fragId),
+              'Cache-Control': 'no-store',
+              'Content-Length': String(bytes.length),
+            })
+            res.end(bytes)
+            return
+          }
+        }
+        serveSound(req, res, set.release)
+      },
+    }))
+`
+
+const PATCHED_SOUND = `    function serveSound(req, res, candidates) {
+      // 第二道防线：candidates 必须是数组。查表若漏了自有属性判定，这里拿到的是
+      // undefined / Object.prototype / Function，loadSound 里 for-of 会抛
+      // TypeError: candidates is not iterable，被宿主兜底 catch 成 400。
+      // 根因见下面 soundSetFor 的注释。
+      const bytes = Array.isArray(candidates) ? loadSound(candidates) : null
+      if (!bytes) {
+        // v752：404 也带 no-store。原来只有 200 分支有缓存头，失败的响应可能被浏览器/中间层
+        // 缓存住，一旦缓存就会变成"永久没声音、刷新也没用"。
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' })
+        res.end('sound unavailable')
+        return
+      }
+      res.writeHead(200, {
+        'Content-Type': 'audio/mpeg',
+        'Cache-Control': 'no-store',
+        'Content-Length': String(bytes.length),
+      })
+      res.end(bytes)
+    }
+
+    // 查表必须走自有属性。SOUND_SETS 是普通对象字面量：SOUND_SETS['__proto__'] 返回
+    // Object.prototype、SOUND_SETS['constructor'] 返回 Function —— 两者都 truthy，
+    // 于是 || SOUND_SETS.duck 的兜底不生效，随后 set.press 是 undefined，
+    // loadSound 里 for-of 抛 TypeError: candidates is not iterable，被宿主兜底 catch 成 400。
+    // ?set=toString / valueOf / hasOwnProperty / isPrototypeOf 等同理。
+    // 不能改成在 soundSetFromUrl 里拒绝：自定义音效组（group_xxx）也要走这个参数。
+    function soundSetFor(name) {
+      return Object.hasOwn(SOUND_SETS, name) ? SOUND_SETS[name] : SOUND_SETS.duck
+    }
+
+    disposers.push(registerRoute({
+      kind: 'exact',
+      path: '/dsh-whale/sound/press.mp3',
+      handler: (req, res) => {
+        const setName = soundSetFromUrl(req.url)
+        const set = soundSetFor(setName)
+        // 自定义音效组：set 为组 id 时按组内 press 片段取音频
+        if (setName && !Object.hasOwn(SOUND_SETS, setName)) {
+          const fragId = groupFragmentId(setName, 'press')
+          if (fragId === '') { res.writeHead(204, { 'Cache-Control': 'no-store' }); res.end(); return } // 留空槽：该事件静音（v752：补 no-store，空响应不允许被缓存）
+          const bytes = loadAudioFragmentBytes(fragId)
+          if (bytes) {
+            res.writeHead(200, {
+              'Content-Type': fragmentMime(fragId),
+              'Cache-Control': 'no-store',
+              'Content-Length': String(bytes.length),
+            })
+            res.end(bytes)
+            return
+          }
+        }
+        serveSound(req, res, set.press)
+      },
+    }))
+
+    disposers.push(registerRoute({
+      kind: 'exact',
+      path: '/dsh-whale/sound/release.mp3',
+      handler: (req, res) => {
+        const setName = soundSetFromUrl(req.url)
+        const set = soundSetFor(setName)
+        if (setName && !Object.hasOwn(SOUND_SETS, setName)) {
+          const fragId = groupFragmentId(setName, 'release')
+          if (fragId === '') { res.writeHead(204, { 'Cache-Control': 'no-store' }); res.end(); return } // 留空槽：该事件静音（v752：补 no-store，空响应不允许被缓存）
+          const bytes = loadAudioFragmentBytes(fragId)
+          if (bytes) {
+            res.writeHead(200, {
+              'Content-Type': fragmentMime(fragId),
+              'Cache-Control': 'no-store',
+              'Content-Length': String(bytes.length),
+            })
+            res.end(bytes)
+            return
+          }
+        }
+        serveSound(req, res, set.release)
+      },
+    }))
+`
 // 打过补丁才有的标记（用于幂等判定与 revert 反向替换）
 const MARK_FENCE = `        if (typeof conn.admit === 'function') return conn`
 const MARK_DISPATCH = `          const admission = conn.admit({ headers: req.headers, method: req.method, url: req.url })`
 const MARK_INJECT = `'connection.authentication'], (ctx) => {`
+const MARK_SOUND = `      const bytes = Array.isArray(candidates) ? loadSound(candidates) : null`
 
 // —— 参数 ——
 
@@ -186,19 +349,22 @@ function snippetAround(src, needles) {
 }
 
 // 返回 { state: 'patched' | 'original' } 或抛错（漂移）
+const MARK_COUNT = 4
+
 function inspect(src) {
   const marks = {
     connectionFence: src.includes(MARK_FENCE),
     rejected分派: src.includes(MARK_DISPATCH),
     inject列表: src.includes(MARK_INJECT),
+    音效查表: src.includes(MARK_SOUND),
   }
   const hit = Object.values(marks).filter(Boolean).length
-  if (hit === 3) return { state: 'patched' }
+  if (hit === MARK_COUNT) return { state: 'patched' }
 
   if (hit > 0) {
     // 只打了一部分：可能是别的补丁、或上游改过其中一处。不猜，直接失败。
     const err = new Error(
-      `文件处于"半打补丁"状态：三处标记只命中 ${hit} 处。`
+      `文件处于"半打补丁"状态：${MARK_COUNT} 处标记只命中 ${hit} 处。`
       + '\n  ' + Object.entries(marks).map(([k, v]) => `${k} 已改：${v ? '是' : '否'}`).join('\n  ')
       + '\n  请先 --revert，或手动核对后再跑。',
     )
@@ -210,14 +376,16 @@ function inspect(src) {
     connectionFence: countOf(src, ORIGINAL_FENCE),
     rejected分派: countOf(src, ORIGINAL_DISPATCH),
     inject列表: countOf(src, ORIGINAL_INJECT),
+    音效查表: countOf(src, ORIGINAL_SOUND),
   }
   if (Object.values(counts).every((n) => n === 1)) return { state: 'original' }
 
-  // 三处都报，别让用户改完一处再撞下一处
+  // 四处都报，别让用户改完一处再撞下一处
   const hints = {
     connectionFence: ['function connectionFence()', 'connectionFence'],
     rejected分派: ['code = conn.requestRejection(req)', 'conn.requestRejection(req)', 'requestRejection'],
     inject列表: ["root.inject(['webServer'", 'root.inject(', 'inject('],
+    音效查表: ['function serveSound(req, res, candidates)', 'serveSound(', 'SOUND_SETS['],
   }
   const problems = Object.entries(counts)
     .filter(([, n]) => n !== 1)
@@ -233,12 +401,14 @@ function applyPatch(src) {
   return src.replace(ORIGINAL_FENCE, PATCHED_FENCE)
     .replace(ORIGINAL_DISPATCH, PATCHED_DISPATCH)
     .replace(ORIGINAL_INJECT, PATCHED_INJECT)
+    .replace(ORIGINAL_SOUND, PATCHED_SOUND)
 }
 
 function reversePatch(src) {
   return src.replace(PATCHED_FENCE, ORIGINAL_FENCE)
     .replace(PATCHED_DISPATCH, ORIGINAL_DISPATCH)
     .replace(PATCHED_INJECT, ORIGINAL_INJECT)
+    .replace(PATCHED_SOUND, ORIGINAL_SOUND)
 }
 
 // —— 语法校验 ——
