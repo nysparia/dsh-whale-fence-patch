@@ -270,3 +270,23 @@ test('没有 connection 服务：connectionFence 为 null，自校验仍生效',
   assert.equal(call(fence, req('GET', '127.0.0.1:3080')), 'PASS', '回环 Host 仍应放行')
   assert.equal(call(fence, req('GET', 'evil.example.com')), 403, '伪造 Host 仍应拒绝')
 })
+
+// ============ 6. inject 列表必须含 connection.authentication ============
+//
+// 这条是真实 DSH 进程里才暴露的坑：admit() 内部访问 this.authentication，
+// 而 Cordis 的 ctx proxy 会把它解析成 connection.authentication 服务。
+// 插件没 inject 这个服务时，属性访问抛
+//   cannot get property "connection.authentication" without inject
+// 于是 admit 每次都抛异常、被 fail-closed 成 403 —— 补丁等于没打。
+// 进程内模拟（直接构造 connection 对象）测不出这一层，只能静态断言源码。
+
+test('inject 列表包含 connection.authentication', () => {
+  // 只认真正的调用（列表里带引号），跳过注释里的 `root.inject([...], cb)` 示例
+  const m = /root\.inject\(\[\s*'([^\]]*)\]/.exec(src)
+  assert.ok(m, '应能找到 root.inject([...]) 声明')
+  const list = m[1].split(',').map((x) => x.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean)
+  assert.ok(
+    list.includes('connection.authentication'),
+    `inject 列表必须含 connection.authentication，实际：${JSON.stringify(list)}`,
+  )
+})

@@ -74,9 +74,19 @@ const PATCHED_DISPATCH = `      let code
       } catch (err) {
 `
 
+// 第三处：inject 列表必须包含 connection.authentication。
+// 为什么：admit() 内部访问 this.authentication，而 Cordis 的 ctx proxy 会把它
+// 解析成 connection.authentication 服务；插件没 inject 这个服务时，属性访问抛
+// `cannot get property "connection.authentication" without inject`，
+// 于是 admit 每次都抛异常、被 fail-closed 成 403 —— 补丁等于没打。
+// 这一条只能在真实 DSH 进程里暴露，进程内模拟测不出来。
+const ORIGINAL_INJECT = `    root.inject(['webServer', 'credentials', 'connection'], (ctx) => {`
+const PATCHED_INJECT = `    root.inject(['webServer', 'credentials', 'connection', 'connection.authentication'], (ctx) => {`
+
 // 打过补丁才有的标记（用于幂等判定与 revert 反向替换）
 const MARK_FENCE = `        if (typeof conn.admit === 'function') return conn`
 const MARK_DISPATCH = `          const admission = conn.admit({ headers: req.headers, method: req.method, url: req.url })`
+const MARK_INJECT = `'connection.authentication'], (ctx) => {`
 
 // —— 参数 ——
 
@@ -177,53 +187,58 @@ function snippetAround(src, needles) {
 
 // 返回 { state: 'patched' | 'original' } 或抛错（漂移）
 function inspect(src) {
-  const hasFenceMark = src.includes(MARK_FENCE)
-  const hasDispatchMark = src.includes(MARK_DISPATCH)
-  if (hasFenceMark && hasDispatchMark) return { state: 'patched' }
+  const marks = {
+    connectionFence: src.includes(MARK_FENCE),
+    rejected分派: src.includes(MARK_DISPATCH),
+    inject列表: src.includes(MARK_INJECT),
+  }
+  const hit = Object.values(marks).filter(Boolean).length
+  if (hit === 3) return { state: 'patched' }
 
-  if (hasFenceMark || hasDispatchMark) {
-    // 只打了一半：可能是别的补丁、或上游改过其中一处。不猜，直接失败。
+  if (hit > 0) {
+    // 只打了一部分：可能是别的补丁、或上游改过其中一处。不猜，直接失败。
     const err = new Error(
-      '文件处于"半打补丁"状态：两处标记只命中一处。'
-      + `\n  connectionFence 已改：${hasFenceMark ? '是' : '否'}`
-      + `\n  rejected 分派已改：${hasDispatchMark ? '是' : '否'}`
+      `文件处于"半打补丁"状态：三处标记只命中 ${hit} 处。`
+      + '\n  ' + Object.entries(marks).map(([k, v]) => `${k} 已改：${v ? '是' : '否'}`).join('\n  ')
       + '\n  请先 --revert，或手动核对后再跑。',
     )
     err.drift = true
     throw err
   }
 
-  const fenceCount = countOf(src, ORIGINAL_FENCE)
-  const dispatchCount = countOf(src, ORIGINAL_DISPATCH)
-  if (fenceCount === 1 && dispatchCount === 1) return { state: 'original' }
+  const counts = {
+    connectionFence: countOf(src, ORIGINAL_FENCE),
+    rejected分派: countOf(src, ORIGINAL_DISPATCH),
+    inject列表: countOf(src, ORIGINAL_INJECT),
+  }
+  if (Object.values(counts).every((n) => n === 1)) return { state: 'original' }
 
-  // 两处都报，别让用户改完一处再撞第二处
-  const problems = []
-  if (fenceCount !== 1) {
-    problems.push(
-      `找不到 connectionFence() 的目标代码块（命中 ${fenceCount} 次，期望 1 次）。`
-      + '\n上游可能改过这段。实际找到的内容片段：\n'
-      + snippetAround(src, ['function connectionFence()', 'connectionFence']),
-    )
+  // 三处都报，别让用户改完一处再撞下一处
+  const hints = {
+    connectionFence: ['function connectionFence()', 'connectionFence'],
+    rejected分派: ['code = conn.requestRejection(req)', 'conn.requestRejection(req)', 'requestRejection'],
+    inject列表: ["root.inject(['webServer'", 'root.inject(', 'inject('],
   }
-  if (dispatchCount !== 1) {
-    problems.push(
-      `找不到 rejected() 里的栅栏分派代码块（命中 ${dispatchCount} 次，期望 1 次）。`
+  const problems = Object.entries(counts)
+    .filter(([, n]) => n !== 1)
+    .map(([name, n]) => `找不到 ${name} 的目标代码块（命中 ${n} 次，期望 1 次）。`
       + '\n上游可能改过这段。实际找到的内容片段：\n'
-      + snippetAround(src, ['code = conn.requestRejection(req)', 'conn.requestRejection(req)', 'requestRejection']),
-    )
-  }
+      + snippetAround(src, hints[name]))
   const err = new Error(problems.join('\n\n'))
   err.drift = true
   throw err
 }
 
 function applyPatch(src) {
-  return src.replace(ORIGINAL_FENCE, PATCHED_FENCE).replace(ORIGINAL_DISPATCH, PATCHED_DISPATCH)
+  return src.replace(ORIGINAL_FENCE, PATCHED_FENCE)
+    .replace(ORIGINAL_DISPATCH, PATCHED_DISPATCH)
+    .replace(ORIGINAL_INJECT, PATCHED_INJECT)
 }
 
 function reversePatch(src) {
-  return src.replace(PATCHED_FENCE, ORIGINAL_FENCE).replace(PATCHED_DISPATCH, ORIGINAL_DISPATCH)
+  return src.replace(PATCHED_FENCE, ORIGINAL_FENCE)
+    .replace(PATCHED_DISPATCH, ORIGINAL_DISPATCH)
+    .replace(PATCHED_INJECT, ORIGINAL_INJECT)
 }
 
 // —— 语法校验 ——

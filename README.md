@@ -1,5 +1,7 @@
 # dsh-whale-fence-patch
 
+> **社区补丁，非上游官方。** 上游 `dsh-whale-widget` 自 0.4.2（2026-10-11）起没有新版本，本仓库是第三方临时方案。上游修复后请卸载。
+
 给已安装的 [`dsh-whale-widget`](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) 打一个约 30 行的信任栅栏兼容补丁，让它在 DSH 0.2.2-rc.2 及以上版本上正常工作。
 
 **本仓库不包含上游的任何代码或素材**，只有一个改写脚本（`patch.mjs`）和它的测试。脚本就地修改你机器上已经装好的那份上游副本，素材仍然用上游的。
@@ -95,7 +97,7 @@ node test/fence.test.mjs --path ~/.dsh/profiles/web/node_modules/dsh-whale-widge
 - **本仓库不包含上游的任何代码或素材。** 仓库里只有 `patch.mjs`、`test/fence.test.mjs`、文档和许可文件。补丁以字符串常量的形式描述"把哪两段改成什么"，不复制上游文件。
 - 上游 `dsh-whale-widget` 的**代码**（`lib/`、`cordis.patch.yml`、`package.json`、文档）是 MIT。
 - 上游的 **`assets/**`（约 6.6MB 图片 / 动图 / 音效）和 `icon.png` 不在 MIT 覆盖范围内**。上游 `PROVENANCE.md` 写明它们"仅授权随本插件运行使用，不授予再许可"。因此本仓库不重新分发它们 —— 补丁只改用户已安装副本里的 `lib/index.js`，素材仍由那份副本提供。
-- 本补丁只改 `lib/index.js` 的两处，净增 24 行（`git diff` 口径：26 增 2 删，共 28 行变动）。
+- 本补丁只改 `lib/index.js` 的两处，净增 24 行（`git diff` 口径：27 增 3 删，共 30 行变动），分布在三处。
 
 ## 上游状态
 
@@ -103,12 +105,43 @@ node test/fence.test.mjs --path ~/.dsh/profiles/web/node_modules/dsh-whale-widge
 
 **上游修复这个问题后，请卸载本补丁**（`--revert`），不要长期叠着。
 
+## 补丁改了三处，不是两处
+
+第三处是 `root.inject([...])` 的列表，必须加上 `'connection.authentication'`。
+
+**为什么**：`admit()` 内部访问 `this.authentication`，而 Cordis 的 `ctx` proxy 会把这个属性解析成 `connection.authentication` 服务。插件没 inject 这个服务时，属性访问抛：
+
+```
+cannot get property "connection.authentication" without inject
+```
+
+于是 `admit` 每次都抛异常，被 fail-closed 成 403 —— 补丁等于没打，而且症状和没打补丁时一模一样（都是 403），很难看出来。
+
+这个坑**只能在真实 DSH 进程里暴露**，进程内模拟（直接构造 connection 对象）测不出来。测试里有一条静态断言守着它。
+
+## 验证记录
+
+在真实 DSH **0.2.3-alpha.2** 进程里端到端验证过（临时 `DSH_HOME`，独立 profile，未触碰任何真实 profile）：
+
+| 用例 | 结果 | 期望 |
+|---|---|---|
+| 回环 + 回环 cookie | 200 | 200 |
+| 宿主信任的权威 + 对应 cookie | **200** | 200 |
+| 伪造 Host + 有效 cookie | 403 | 403 |
+| 宿主信任的权威 + 无 cookie | 401 | 401 |
+| `Sec-Fetch-Site: cross-site` | 403 | 403 |
+| 跨源 Origin | 403 | 403 |
+| POST 回环（写配置） | 非 403 | 非 403 |
+| POST 宿主信任的权威（写配置） | 403 | 403 |
+
+补丁前，第二行是 **403**（就是 issue #277）；补丁后是 200。启动日志里那条 `宿主信任栅栏不可用` 的 warn 也消失了。
+
 ## 已知限制
 
-- 只在 **DSH 0.2.3-alpha.2** 上测过。0.2.2-rc.2 到 0.2.3-alpha.2 之间的版本没有逐个验证。
-- **没有在真实 DSH 进程里做端到端验证**，只做了进程内模拟：把栅栏代码段抽出来喂给构造的 connection 对象。真实宿主里 `admit` 的返回形态、`principal.kind` 的取值、`trustedHosts` 的实际生效路径，都只按迁移指南和参考实现推断，没有实测。
-- 补丁按上游 0.4.2 的代码逐字节匹配。上游一旦改动这两段，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
+- 只在 **DSH 0.2.3-alpha.2** 上端到端验证过。0.2.2-rc.2 到 0.2.3-alpha.2 之间的版本没有逐个验证。
+- 补丁按上游 0.4.2 的代码逐字节匹配三处锚点。上游一旦改动其中任何一处，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
 - 只处理 `lib/index.js`。如果上游把栅栏逻辑挪到别的文件，补丁不适用。
+- 写请求（POST/PUT/PATCH/DELETE）仍然只允许回环来源，这是上游 0.3.15 起的既有策略（`writeRejection`），本补丁没有放宽。远端管理仍需 `DSHW_ADMIN_HOSTS`。
 
 ## 参考
 
