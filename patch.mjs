@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // dsh-whale-fence-patch —— 给已安装的 dsh-whale-widget 打上游 bug 的补丁。
 //
-// 改 lib/index.js 里的十组（共 30 个锚点）：
+// 改**两个**文件：
+//
+// 【lib/index.js】十组（共 30 个锚点）：
 //   ① connectionFence()           —— 栅栏兼容（DSH >= 0.2.2-rc.2 的 admit）
 //   ② rejected() 的栅栏分派        —— 同上
 //   ③ root.inject 列表             —— 补 connection.authentication，否则 admit 恒抛
@@ -12,6 +14,13 @@
 //   ⑧ 配置文件损坏备份              —— backupCorruptFile + 四个读取函数
 //   ⑨ waitState 跨会话状态污染       —— 按会话分桶 + waitView() 选一个会话上报（子 agent 不再清主会话挂起）
 //   ⑩ 账本 IO 退避 + update-check 去重 —— Atomics.wait 退避 305ms→25ms；并发只打一轮上游
+//
+// 【assets/whale-widget.js】两组（共 15 个锚点）：
+//   ⑪ issue #339：onDocPointerMoveCursor 每次 pointermove 都强制同步布局
+//      —— rAF 节流 + 用 e.target 代替 elementFromPoint + 矩形/命中图 alpha 表缓存
+//   ⑫ issue #342：每秒轮询无 in-flight 守卫、页面隐藏时不暂停
+//      —— 两个 poll 各加 busy 守卫 + document.hidden 跳过 + visibilitychange 回前台补一次
+//
 // 不复制、不分发上游任何代码或素材；素材仍由用户已安装的上游副本提供。
 //
 // 用法：
@@ -19,7 +28,7 @@
 //   node patch.mjs                    # 遍历 ~/.dsh/profiles/*/node_modules/dsh-whale-widget
 //   node patch.mjs --path <dir>       # 直接指定插件目录
 //   node patch.mjs --check            # 只报告会改什么，不写
-//   node patch.mjs --revert           # 还原
+//   node patch.mjs --revert           # 还原（两个文件一起还原）
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -27,8 +36,14 @@ import os from 'node:os'
 import { execFileSync } from 'node:child_process'
 
 const PKG = 'dsh-whale-widget'
-const TARGET_REL = path.join('lib', 'index.js')
-const BACKUP_REL = path.join('lib', 'index.js.bak')
+// 补丁要改**两个**文件：
+//   lib/index.js         —— 宿主侧（Node）：栅栏、路由、配置读写、轮询状态
+//   assets/whale-widget.js —— 前端侧（浏览器）：命中测试、光标判定、每秒轮询
+// 每个锚点用 file 字段标注归属；inspect/applyPatch/reversePatch 都按文件分组处理。
+const HOST_REL = path.join('lib', 'index.js')
+const FRONT_REL = path.join('assets', 'whale-widget.js')
+const TARGET_FILES = [HOST_REL, FRONT_REL]
+const backupRel = (rel) => rel + '.bak'
 
 // —— 上游 0.4.2 原版的两段目标代码（逐字节匹配，不做模糊定位）——
 
@@ -1292,6 +1307,490 @@ const NEW_ANCHORS = [
 
 ]
 
+// ============================================================================
+// 前端侧（assets/whale-widget.js）的两组修复
+//
+// ⑪ issue #339：onDocPointerMoveCursor 每次 pointermove 都强制同步布局
+//    旧实现挂在 document 上、capture 阶段、无条件注册，每次移动做三件昂贵的事：
+//      · document.elementFromPoint(x, y)          —— 强制同步布局
+//      · isWhaleHit() 里 img.getBoundingClientRect() —— 又一次强制布局
+//      · isWhaleHit() 里 getImageData(1,1)         —— canvas 回读，GPU→CPU 同步
+//    修法三层：rAF 节流（一帧最多判定一次）+ 用事件自带的 e.target 代替 elementFromPoint
+//    + 矩形与命中图 alpha 表都缓存。缓存**只用于光标路径**，点击/拖动仍现取现算。
+//
+// ⑫ issue #342：每秒轮询无 in-flight 守卫、页面隐藏时不暂停
+//    pollWaitState / pollLastTurn 直接 fetch，响应慢于 1 秒时请求堆叠；后台仍每秒 2 个请求。
+//    修法：各自一个 busy 布尔 + document.hidden 跳过 + visibilitychange 回前台立刻补一次。
+// ============================================================================
+
+// ⑪-1 express() 尾部：几何变了 ⇒ 光标路径的矩形缓存作废
+const ORIGINAL_EXPRESS_TAIL = `  root.classList.toggle('dshwv-left', !!state.flip)
+}
+function settle() {`
+
+const PATCHED_EXPRESS_TAIL = `  root.classList.toggle('dshwv-left', !!state.flip)
+  // issue #339：几何变了 ⇒ 光标路径的矩形缓存作废（过渡期间还会再失效一次）
+  try { invalidateCursorRectSoon() } catch (err) {}
+}
+function settle() {`
+
+const MARK_EXPRESS_TAIL = `  try { invalidateCursorRectSoon() } catch (err) {}`
+
+// ⑪-2 命中图 alpha 表：声明 + setupHitTest 开头清空
+const ORIGINAL_HIT_DECL = `var hitFailed = false // 命中图加载失败（如图片 404/资源缺失）：退回矩形区域判定，绝不吞掉整页事件
+function setupHitTest(url) {
+  try {
+    hitCanvas = document.createElement('canvas')
+    hitCanvas.width = 610
+    hitCanvas.height = 610
+    hitReady = false
+    hitFailed = false
+    var probe = new Image()`
+
+const PATCHED_HIT_DECL = `var hitFailed = false // 命中图加载失败（如图片 404/资源缺失）：退回矩形区域判定，绝不吞掉整页事件
+// issue #339：命中图的 alpha 通道整张缓存（610×610 = 372KB）。
+// 旧实现每次 isWhaleHit 都 getImageData(1,1) —— canvas 回读是 GPU→CPU 同步，
+// 而 isWhaleHit 在每次 pointermove 上都会被调用。现在只在命中图建好时读一次整张，
+// 之后查表（hitAlpha[y * 610 + x] > 10），语义与逐点读完全一致。
+var hitAlpha = null
+function setupHitTest(url) {
+  try {
+    hitCanvas = document.createElement('canvas')
+    hitCanvas.width = 610
+    hitCanvas.height = 610
+    hitReady = false
+    hitFailed = false
+    hitAlpha = null
+    var probe = new Image()`
+
+const MARK_HIT_DECL = `var hitAlpha = null
+function setupHitTest(url) {`
+
+// ⑪-3 setupHitTest：整张读一次，只留 alpha
+const ORIGINAL_HIT_READ = `        ctx.drawImage(probe, dx, dy, dw, dh)
+        // v756（issue #144）：画布读回可能被浏览器**抹白** —— Firefox 开启「隐私保护 / resistFingerprinting」`
+
+const PATCHED_HIT_READ = `        ctx.drawImage(probe, dx, dy, dw, dh)
+        // issue #339：整张读一次（1.5MB 的 ImageData 只活在这一帧），只留 alpha（372KB）。
+        // 读不出来（隐私保护/跨域污染）会抛错 → 落到下面的 catch，与旧行为一致。
+        var full = ctx.getImageData(0, 0, 610, 610).data
+        var alpha = new Uint8Array(610 * 610)
+        for (var ai = 0, aj = 3; ai < alpha.length; ai++, aj += 4) alpha[ai] = full[aj]
+        hitAlpha = alpha
+        // v756（issue #144）：画布读回可能被浏览器**抹白** —— Firefox 开启「隐私保护 / resistFingerprinting」`
+
+const MARK_HIT_READ = `        var full = ctx.getImageData(0, 0, 610, 610).data`
+
+// ⑪-4 setupHitTest：不透明采样改查 alpha 表
+const ORIGINAL_HIT_SAMPLE = `            if (ctx.getImageData(px, py, 1, 1).data[3] > 10) opaque++
+          }
+        }
+        if (!opaque) { hitReady = false; hitFailed = true; applyHitClip(''); return }`
+
+const PATCHED_HIT_SAMPLE = `            if (alpha[py * 610 + px] > 10) opaque++
+          }
+        }
+        if (!opaque) { hitReady = false; hitFailed = true; hitAlpha = null; applyHitClip(''); return }`
+
+const MARK_HIT_SAMPLE = `            if (alpha[py * 610 + px] > 10) opaque++`
+
+// ⑪-5 whaleRectHit → whaleRectHitAt（可注入缓存矩形）
+const ORIGINAL_RECT_HIT = `function whaleRectHit(e) {
+  try {
+    var fr = img.getBoundingClientRect()
+    if (!fr || fr.width <= 0 || fr.height <= 0) return false
+    return e.clientX >= fr.left && e.clientX <= fr.right && e.clientY >= fr.top && e.clientY <= fr.bottom
+  } catch (err) { return false }
+}`
+
+const PATCHED_RECT_HIT = `function whaleRectHit(e) {
+  return whaleRectHitAt(e.clientX, e.clientY)
+}
+function whaleRectHitAt(x, y, cachedRect) {
+  try {
+    var fr = cachedRect || img.getBoundingClientRect()
+    if (!fr || fr.width <= 0 || fr.height <= 0) return false
+    return x >= fr.left && x <= fr.right && y >= fr.top && y <= fr.bottom
+  } catch (err) { return false }
+}`
+
+const MARK_RECT_HIT = `function whaleRectHitAt(x, y, cachedRect) {`
+
+// ⑪-6 buildHitClipPath：改读 alpha 表，不再自己回读画布
+const ORIGINAL_CLIP_PATH = `    var c = hitCanvas && hitCanvas.getContext ? hitCanvas.getContext('2d') : null
+    if (!c) return ''
+    var data = c.getImageData(0, 0, 610, 610).data // 只读一次（1.5MB），别逐行读
+    var pts = []
+    for (var y = 0; y < 610; y++) {
+      var l = -1, r = -1
+      var base = y * 610 * 4
+      for (var x = 0; x < 610; x++) {
+        if (data[base + x * 4 + 3] > 10) { if (l < 0) l = x; r = x }
+      }`
+
+const PATCHED_CLIP_PATH = `    if (!hitAlpha) return ''
+    var data = hitAlpha // 整张 alpha 表（见 setupHitTest），不再逐点回读画布
+    var pts = []
+    for (var y = 0; y < 610; y++) {
+      var l = -1, r = -1
+      var base = y * 610
+      for (var x = 0; x < 610; x++) {
+        if (data[base + x] > 10) { if (l < 0) l = x; r = x }
+      }`
+
+const MARK_CLIP_PATH = `    var data = hitAlpha // 整张 alpha 表（见 setupHitTest），不再逐点回读画布`
+
+// ⑪-7 isWhaleHit → isWhaleHitAt（可注入缓存矩形 + 查 alpha 表）
+const ORIGINAL_IS_HIT = `function isWhaleHit(e) {
+  // 命中图未就绪/失败时：绝不默认“全屏都是鲸鱼”。
+  // 加载中 → 返回 false（不拦截页面）；加载失败 → 退回图像矩形区域，仅挂件区域可拖。
+  if (!hitCanvas || !hitReady) {
+    if (!hitFailed) return false
+    return whaleRectHit(e)
+  }
+  try {
+    var r = img.getBoundingClientRect()
+    if (!r || r.width <= 0 || r.height <= 0) return false
+    var lx = (e.clientX - r.left) / r.width * 610
+    var ly = (e.clientY - r.top) / r.height * 610
+    if (lx < 0 || ly < 0 || lx >= 610 || ly >= 610) return false
+    if (state.flip) lx = 610 - lx
+    var data
+    try {
+      data = hitCanvas.getContext('2d').getImageData(Math.floor(lx), Math.floor(ly), 1, 1).data
+    } catch (err) {
+      // v756（issue #144）：画布读不出来（隐私保护/跨域污染）→ 立刻降级为矩形判定，
+      // 并且**记住**这个状态，后续调用直接走矩形，不再每次抛错。
+      hitReady = false
+      hitFailed = true
+      return whaleRectHit(e)
+    }
+    return data[3] > 10
+  } catch (err) {
+    return false
+  }
+}`
+
+const PATCHED_IS_HIT = `function isWhaleHit(e) {
+  return isWhaleHitAt(e.clientX, e.clientY)
+}
+// issue #339：把「按坐标判定」抽出来，让高频的 pointermove 光标路径可以传入**缓存的矩形**
+// （见 cursorImgRect），避免每次移动都 img.getBoundingClientRect() 强制同步布局。
+// 点击/拖动/click 拦截这些低频且必须精确的路径仍然传 undefined ⇒ 现取现算，行为与旧版一致。
+function isWhaleHitAt(x, y, cachedRect) {
+  // 命中图未就绪/失败时：绝不默认“全屏都是鲸鱼”。
+  // 加载中 → 返回 false（不拦截页面）；加载失败 → 退回图像矩形区域，仅挂件区域可拖。
+  if (!hitCanvas || !hitReady) {
+    if (!hitFailed) return false
+    return whaleRectHitAt(x, y, cachedRect)
+  }
+  try {
+    var r = cachedRect || img.getBoundingClientRect()
+    if (!r || r.width <= 0 || r.height <= 0) return false
+    var lx = (x - r.left) / r.width * 610
+    var ly = (y - r.top) / r.height * 610
+    if (lx < 0 || ly < 0 || lx >= 610 || ly >= 610) return false
+    if (state.flip) lx = 610 - lx
+    var ix = Math.floor(lx)
+    var iy = Math.floor(ly)
+    if (ix < 0) ix = 0
+    if (ix > 609) ix = 609
+    if (iy < 0) iy = 0
+    if (iy > 609) iy = 609
+    if (hitAlpha) return hitAlpha[iy * 610 + ix] > 10
+    // 兜底：alpha 表没建起来（理论上不会发生）→ 退回逐点回读
+    try {
+      var data = hitCanvas.getContext('2d').getImageData(ix, iy, 1, 1).data
+      return data[3] > 10
+    } catch (err) {
+      // v756（issue #144）：画布读不出来（隐私保护/跨域污染）→ 立刻降级为矩形判定，
+      // 并且**记住**这个状态，后续调用直接走矩形，不再每次抛错。
+      hitReady = false
+      hitFailed = true
+      return whaleRectHitAt(x, y, cachedRect)
+    }
+  } catch (err) {
+    return false
+  }
+}`
+
+const MARK_IS_HIT = `function isWhaleHitAt(x, y, cachedRect) {`
+
+// ⑪-8 光标路径的矩形缓存 + onDocPointerMoveCursor 改成 rAF 节流
+const ORIGINAL_CURSOR_HEAD = `function onDocPointerMoveCursor(e) {
+  if (drag && drag.active) {`
+
+const PATCHED_CURSOR_HEAD = `// —— issue #339：pointermove 光标判定的三层降本 ——
+//   ① rAF 节流：pointermove 只记坐标，一帧最多判定一次（1000Hz 回报率鼠标 → 60Hz）；
+//   ② 不再 document.elementFromPoint：事件自带的 e.target 就是同一次命中测试的结果，
+//      拿它做 closest() 判断零成本（elementFromPoint 会强制同步布局）；
+//   ③ 矩形与命中图都缓存：img.getBoundingClientRect() 只在失效后重算，命中图查 alpha 表。
+// 缓存**只用于光标路径**；点击/拖动/click 拦截仍现取现算，避免缓存过期导致"点不动"。
+var cursorRectCache = null
+var cursorRectTimer = 0
+function invalidateCursorRect() { cursorRectCache = null }
+// express() 之后 left/top 有 .16s 过渡，过渡期间矩形在动：立刻失效一次，
+// 再在过渡结束后（transitionend 或 260ms 兜底）失效一次，避免缓存停在过渡起点。
+function invalidateCursorRectSoon() {
+  invalidateCursorRect()
+  if (cursorRectTimer) return
+  cursorRectTimer = setTimeout(function () {
+    cursorRectTimer = 0
+    invalidateCursorRect()
+  }, 260)
+}
+function cursorImgRect() {
+  if (cursorRectCache) return cursorRectCache
+  try { cursorRectCache = img.getBoundingClientRect() } catch (err) { cursorRectCache = null }
+  return cursorRectCache
+}
+var cursorRafId = 0
+var cursorPending = null
+function onDocPointerMoveCursor(e) {
+  if (drag && drag.active) {`
+
+const MARK_CURSOR_HEAD = `var cursorRectCache = null`
+
+// ⑪-9 主体：elementFromPoint → 记录坐标 + rAF
+const ORIGINAL_CURSOR_BODY = `  var el = null
+  try { el = document.elementFromPoint(e.clientX, e.clientY) } catch (err) {}`
+
+const PATCHED_CURSOR_BODY = `  // ① 只记录，判定推迟到下一帧（同一帧内多次移动只算一次）
+  cursorPending = { x: e.clientX, y: e.clientY, target: e.target || null }
+  if (cursorRafId) return
+  try {
+    cursorRafId = requestAnimationFrame(flushCursorMove)
+  } catch (err) {
+    cursorRafId = 0
+    flushCursorMove()
+  }
+}
+function flushCursorMove() {
+  cursorRafId = 0
+  var p = cursorPending
+  cursorPending = null
+  if (!p) return
+  applyCursorMove(p)
+}
+function applyCursorMove(p) {
+  if (drag && drag.active) return
+  // ② 事件自带的 target 就是 elementFromPoint 的答案，且不触发布局。
+  //    只有拿不到 target 的极端情况才退回 elementFromPoint。
+  var el = p.target
+  if (!el) {
+    try { el = document.elementFromPoint(p.x, p.y) } catch (err) { el = null }
+  }`
+
+const MARK_CURSOR_BODY = `function applyCursorMove(p) {`
+
+// ⑪-10 主体：命中判定改走矩形粗判 + 缓存矩形
+const ORIGINAL_CURSOR_OVER = `  var over = isWhaleHit(e)`
+
+const PATCHED_CURSOR_OVER = `  // ③ 矩形粗判：指针在挂件矩形之外时连命中图都不查（也不碰任何 DOM 几何）
+  var r = cursorImgRect()
+  var over = false
+  if (r && r.width > 0 && r.height > 0 &&
+      p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom) {
+    over = isWhaleHitAt(p.x, p.y, r)
+  }`
+
+const MARK_CURSOR_OVER = `    over = isWhaleHitAt(p.x, p.y, r)`
+
+// ⑪-11 矩形缓存的失效点
+const ORIGINAL_CURSOR_LISTEN = `document.addEventListener('pointermove', onDocPointerMoveCursor, true)
+// 启动即应用一次菜单按钮可见性`
+
+const PATCHED_CURSOR_LISTEN = `document.addEventListener('pointermove', onDocPointerMoveCursor, true)
+// 矩形缓存的失效点：窗口尺寸/滚动、图片加载完成、过渡结束（left/top 有 .16s 过渡）。
+try { window.addEventListener('resize', invalidateCursorRect, { passive: true }) } catch (err) {}
+try { window.addEventListener('scroll', invalidateCursorRect, { capture: true, passive: true }) } catch (err) {}
+try { img.addEventListener('load', invalidateCursorRect) } catch (err) {}
+try { root.addEventListener('transitionend', invalidateCursorRect) } catch (err) {}
+// 启动即应用一次菜单按钮可见性`
+
+const MARK_CURSOR_LISTEN = `try { window.addEventListener('scroll', invalidateCursorRect, { capture: true, passive: true }) } catch (err) {}`
+
+// ⑪-12 endDrag：拖动结束作废矩形缓存
+const ORIGINAL_ENDDRAG = `  pressUp()
+  root.classList.remove('dshwv-dragging')
+  // issue #79 缺陷2`
+
+const PATCHED_ENDDRAG = `  pressUp()
+  root.classList.remove('dshwv-dragging')
+  // issue #339：拖动期间挂件一直在动，光标路径的矩形缓存必须作废
+  try { invalidateCursorRect() } catch (err) {}
+  // issue #79 缺陷2`
+
+const MARK_ENDDRAG = `  // issue #339：拖动期间挂件一直在动，光标路径的矩形缓存必须作废`
+
+// ⑫-1 pollWaitState：in-flight 守卫 + 后台跳过
+const ORIGINAL_POLL_WAIT_HEAD = `function pollWaitState() {
+  try {
+    fetch(WAIT_URL, { cache: 'no-store' })`
+
+const PATCHED_POLL_WAIT_HEAD = `// issue #342：in-flight 守卫。宿主响应慢于 1 秒时，旧实现每秒再发一个 —— 请求会堆叠，
+// 而且每个响应回来都要跑一遍渲染/去重逻辑。同一时刻只允许一个在飞。
+var pollWaitBusy = false
+function pollWaitState() {
+  if (pollWaitBusy) return
+  // 页面在后台不轮询：浏览器会把定时器节流到 1/分钟，但前台可见时是实打实的 2 req/s。
+  // 回到前台由 visibilitychange 立刻补一次（见文件末尾）。
+  if (document.hidden) return
+  pollWaitBusy = true
+  var done = function () { pollWaitBusy = false }
+  try {
+    fetch(WAIT_URL, { cache: 'no-store' })`
+
+const MARK_POLL_WAIT_HEAD = `var pollWaitBusy = false`
+
+// ⑫-2 pollWaitState 收尾 + pollLastTurn 开头
+const ORIGINAL_POLL_WAIT_TAIL = `        if (on && sel && ev.soundOn !== false) playBindingSound({ on: true, sel: sel }, ev)
+      })
+      .catch(function () {})
+  } catch (err) {}
+}
+function pollLastTurn() {
+  try {
+    fetch(LAST_TURN_URL, { cache: 'no-store' })`
+
+const PATCHED_POLL_WAIT_TAIL = `        if (on && sel && ev.soundOn !== false) playBindingSound({ on: true, sel: sel }, ev)
+      })
+      .then(done, done)
+  } catch (err) { done() }
+}
+var pollLastTurnBusy = false
+function pollLastTurn() {
+  if (pollLastTurnBusy) return
+  if (document.hidden) return
+  pollLastTurnBusy = true
+  var done = function () { pollLastTurnBusy = false }
+  try {
+    fetch(LAST_TURN_URL, { cache: 'no-store' })`
+
+const MARK_POLL_WAIT_TAIL = `var pollLastTurnBusy = false`
+
+// ⑫-3 pollLastTurn 收尾 + 回前台立刻补一次
+const ORIGINAL_POLL_TURN_TAIL = `      })
+      .catch(function () {})
+  } catch (err) {}
+}
+setInterval(function () { pollLastTurn(); pollWaitState() }, 1000)
+}`
+
+const PATCHED_POLL_TURN_TAIL = `      })
+      .then(done, done)
+  } catch (err) { done() }
+}
+setInterval(function () { pollLastTurn(); pollWaitState() }, 1000)
+// issue #342：页面回到前台立刻补一次（后台期间被跳过的轮询不补，避免切回来瞬间打一串请求）。
+// 两个 poll 各自有 in-flight 守卫，这里连调两次也不会并发。
+try {
+  document.addEventListener('visibilitychange', function () {
+    try {
+      if (document.hidden) return
+      pollLastTurn()
+      pollWaitState()
+    } catch (err) {}
+  })
+} catch (err) {}
+}`
+
+const MARK_POLL_TURN_TAIL = `      pollLastTurn()
+      pollWaitState()`
+
+const FRONT_ANCHORS = [
+  {
+    file: FRONT_REL,
+    name: 'express() 作废光标矩形缓存',
+    from: ORIGINAL_EXPRESS_TAIL, to: PATCHED_EXPRESS_TAIL, mark: MARK_EXPRESS_TAIL,
+    hints: ['function express()', "root.classList.toggle('dshwv-left'", 'function settle()'],
+  },
+  {
+    file: FRONT_REL,
+    name: '命中图 alpha 表（声明）',
+    from: ORIGINAL_HIT_DECL, to: PATCHED_HIT_DECL, mark: MARK_HIT_DECL,
+    hints: ['var hitFailed = false', 'function setupHitTest(url)', 'var probe = new Image()'],
+  },
+  {
+    file: FRONT_REL,
+    name: '命中图 alpha 表（整张读一次）',
+    from: ORIGINAL_HIT_READ, to: PATCHED_HIT_READ, mark: MARK_HIT_READ,
+    hints: ['ctx.drawImage(probe, dx, dy, dw, dh)', 'v756（issue #144）'],
+  },
+  {
+    file: FRONT_REL,
+    name: '命中图 alpha 表（不透明采样）',
+    from: ORIGINAL_HIT_SAMPLE, to: PATCHED_HIT_SAMPLE, mark: MARK_HIT_SAMPLE,
+    hints: ['opaque++', 'if (!opaque) { hitReady = false'],
+  },
+  {
+    file: FRONT_REL,
+    name: 'whaleRectHit → whaleRectHitAt',
+    from: ORIGINAL_RECT_HIT, to: PATCHED_RECT_HIT, mark: MARK_RECT_HIT,
+    hints: ['function whaleRectHit(e)', 'img.getBoundingClientRect()'],
+  },
+  {
+    file: FRONT_REL,
+    name: 'buildHitClipPath 改读 alpha 表',
+    from: ORIGINAL_CLIP_PATH, to: PATCHED_CLIP_PATH, mark: MARK_CLIP_PATH,
+    hints: ['function buildHitClipPath()', 'getImageData(0, 0, 610, 610)'],
+  },
+  {
+    file: FRONT_REL,
+    name: 'isWhaleHit → isWhaleHitAt',
+    from: ORIGINAL_IS_HIT, to: PATCHED_IS_HIT, mark: MARK_IS_HIT,
+    hints: ['function isWhaleHit(e)', 'getImageData(Math.floor(lx), Math.floor(ly), 1, 1)'],
+  },
+  {
+    file: FRONT_REL,
+    name: '光标矩形缓存 + onDocPointerMoveCursor 头',
+    from: ORIGINAL_CURSOR_HEAD, to: PATCHED_CURSOR_HEAD, mark: MARK_CURSOR_HEAD,
+    hints: ['function onDocPointerMoveCursor(e)', 'if (drag && drag.active) {'],
+  },
+  {
+    file: FRONT_REL,
+    name: '光标判定改 rAF 节流',
+    from: ORIGINAL_CURSOR_BODY, to: PATCHED_CURSOR_BODY, mark: MARK_CURSOR_BODY,
+    hints: ['var el = null', 'document.elementFromPoint(e.clientX, e.clientY)'],
+  },
+  {
+    file: FRONT_REL,
+    name: '光标判定改矩形粗判',
+    from: ORIGINAL_CURSOR_OVER, to: PATCHED_CURSOR_OVER, mark: MARK_CURSOR_OVER,
+    hints: ['var over = isWhaleHit(e)', 'setWidgetCursor(over'],
+  },
+  {
+    file: FRONT_REL,
+    name: '光标矩形缓存失效点',
+    from: ORIGINAL_CURSOR_LISTEN, to: PATCHED_CURSOR_LISTEN, mark: MARK_CURSOR_LISTEN,
+    hints: ["document.addEventListener('pointermove', onDocPointerMoveCursor, true)", '启动即应用一次菜单按钮可见性'],
+  },
+  {
+    file: FRONT_REL,
+    name: 'endDrag 作废光标矩形缓存',
+    from: ORIGINAL_ENDDRAG, to: PATCHED_ENDDRAG, mark: MARK_ENDDRAG,
+    hints: ['function endDrag(e, clickAllowed, cancelled)', "root.classList.remove('dshwv-dragging')"],
+  },
+  {
+    file: FRONT_REL,
+    name: 'pollWaitState in-flight 守卫',
+    from: ORIGINAL_POLL_WAIT_HEAD, to: PATCHED_POLL_WAIT_HEAD, mark: MARK_POLL_WAIT_HEAD,
+    hints: ['function pollWaitState()', 'fetch(WAIT_URL'],
+  },
+  {
+    file: FRONT_REL,
+    name: 'pollWaitState 收尾 + pollLastTurn 守卫',
+    from: ORIGINAL_POLL_WAIT_TAIL, to: PATCHED_POLL_WAIT_TAIL, mark: MARK_POLL_WAIT_TAIL,
+    hints: ['playBindingSound({ on: true, sel: sel }, ev)', 'function pollLastTurn()'],
+  },
+  {
+    file: FRONT_REL,
+    name: 'pollLastTurn 收尾 + 回前台补一次',
+    from: ORIGINAL_POLL_TURN_TAIL, to: PATCHED_POLL_TURN_TAIL, mark: MARK_POLL_TURN_TAIL,
+    hints: ['setInterval(function () { pollLastTurn(); pollWaitState() }, 1000)', 'visibilitychange'],
+  },
+]
+
 // —— 参数 ——
 
 function parseArgs(argv) {
@@ -1320,14 +1819,14 @@ const USAGE = `用法：
   node patch.mjs                    遍历 ~/.dsh/profiles/*/node_modules/dsh-whale-widget
   node patch.mjs --path <dir>       直接指定插件目录（或含 node_modules/dsh-whale-widget 的目录）
   node patch.mjs --check            只报告会改什么，不写文件
-  node patch.mjs --revert           还原到打补丁前（优先用 lib/index.js.bak）`
+  node patch.mjs --revert           还原到打补丁前（优先用 *.bak，两个文件一起还原）`
 
 // —— 定位 ——
 
 function looksLikePlugin(dir) {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
-    return pkg.name === PKG && fs.existsSync(path.join(dir, TARGET_REL))
+    return pkg.name === PKG && fs.existsSync(path.join(dir, HOST_REL))
   } catch (err) { return false }
 }
 
@@ -1337,7 +1836,7 @@ function resolveTargets(opts) {
     if (looksLikePlugin(abs)) return [abs]
     const nested = path.join(abs, 'node_modules', PKG)
     if (looksLikePlugin(nested)) return [nested]
-    if (fs.existsSync(path.join(abs, TARGET_REL))) return [abs] // 没有 package.json 也认，交给后面报错
+    if (fs.existsSync(path.join(abs, HOST_REL))) return [abs] // 没有 package.json 也认，交给后面报错
     console.error(`在 ${abs} 找不到 ${PKG}（既不是插件目录，也没有 node_modules/${PKG}）`)
     process.exit(1)
   }
@@ -1389,25 +1888,55 @@ function snippetAround(src, needles) {
   return '    （连锚点都找不到）'
 }
 
-// 返回 { state: 'patched' | 'original' } 或抛错（漂移）
-// 4 个原有锚点 + NEW_ANCHORS 表里的全部新增锚点
-const MARK_COUNT = 4 + NEW_ANCHORS.length
+// —— 锚点表：按目标文件分组 ——
+// 4 个原有锚点 + NEW_ANCHORS 表里的全部新增锚点，都落在 lib/index.js；
+// FRONT_ANCHORS 全部落在 assets/whale-widget.js。
+const HOST_ANCHORS = [
+  {
+    file: HOST_REL,
+    name: 'connectionFence 栅栏兼容',
+    from: ORIGINAL_FENCE, to: PATCHED_FENCE, mark: MARK_FENCE,
+    hints: ['function connectionFence()', 'connectionFence', 'requestRejection'],
+  },
+  {
+    file: HOST_REL,
+    name: 'rejected() 栅栏分派',
+    from: ORIGINAL_DISPATCH, to: PATCHED_DISPATCH, mark: MARK_DISPATCH,
+    hints: ['code = conn.requestRejection(req)', 'conn.requestRejection(req)', 'requestRejection'],
+  },
+  {
+    file: HOST_REL,
+    name: 'root.inject 列表',
+    from: ORIGINAL_INJECT, to: PATCHED_INJECT, mark: MARK_INJECT,
+    hints: ["root.inject(['webServer'", 'root.inject(', 'inject('],
+  },
+  {
+    file: HOST_REL,
+    name: '音效查表原型链',
+    from: ORIGINAL_SOUND, to: PATCHED_SOUND, mark: MARK_SOUND,
+    hints: ['function serveSound(req, res, candidates)', 'serveSound(', 'SOUND_SETS['],
+  },
+  ...NEW_ANCHORS.map((a) => ({ ...a, file: HOST_REL })),
+]
 
-function inspect(src) {
-  const marks = {
-    connectionFence: src.includes(MARK_FENCE),
-    rejected分派: src.includes(MARK_DISPATCH),
-    inject列表: src.includes(MARK_INJECT),
-    音效查表: src.includes(MARK_SOUND),
-  }
-  for (const a of NEW_ANCHORS) marks[a.name] = src.includes(a.mark)
+const ANCHORS = [...HOST_ANCHORS, ...FRONT_ANCHORS]
+const anchorsFor = (rel) => ANCHORS.filter((a) => a.file === rel)
+// 每个文件的锚点数（半打补丁检测按文件算）
+const MARK_COUNT = Object.fromEntries(TARGET_FILES.map((rel) => [rel, anchorsFor(rel).length]))
+
+// 返回 { state: 'patched' | 'original', total } 或抛错（漂移 / 半打补丁）
+function inspectFile(src, rel) {
+  const list = anchorsFor(rel)
+  const total = list.length
+  const marks = {}
+  for (const a of list) marks[a.name] = src.includes(a.mark)
   const hit = Object.values(marks).filter(Boolean).length
-  if (hit === MARK_COUNT) return { state: 'patched' }
+  if (hit === total) return { state: 'patched', total }
 
   if (hit > 0) {
     // 只打了一部分：可能是别的补丁、或上游改过其中一处。不猜，直接失败。
     const err = new Error(
-      `文件处于"半打补丁"状态：${MARK_COUNT} 处标记只命中 ${hit} 处。`
+      `${rel} 处于"半打补丁"状态：${total} 处标记只命中 ${hit} 处。`
       + '\n  ' + Object.entries(marks).map(([k, v]) => `${k} 已改：${v ? '是' : '否'}`).join('\n  ')
       + '\n  请先 --revert，或手动核对后再跑。',
     )
@@ -1415,50 +1944,32 @@ function inspect(src) {
     throw err
   }
 
-  const counts = {
-    connectionFence: countOf(src, ORIGINAL_FENCE),
-    rejected分派: countOf(src, ORIGINAL_DISPATCH),
-    inject列表: countOf(src, ORIGINAL_INJECT),
-    音效查表: countOf(src, ORIGINAL_SOUND),
-  }
-  for (const a of NEW_ANCHORS) counts[a.name] = countOf(src, a.from)
-  if (Object.values(counts).every((n) => n === 1)) return { state: 'original' }
+  const counts = {}
+  for (const a of list) counts[a.name] = countOf(src, a.from)
+  if (Object.values(counts).every((n) => n === 1)) return { state: 'original', total }
 
-  // 四处都报，别让用户改完一处再撞下一处
-  const hints = {
-    connectionFence: ['function connectionFence()', 'connectionFence'],
-    rejected分派: ['code = conn.requestRejection(req)', 'conn.requestRejection(req)', 'requestRejection'],
-    inject列表: ["root.inject(['webServer'", 'root.inject(', 'inject('],
-    音效查表: ['function serveSound(req, res, candidates)', 'serveSound(', 'SOUND_SETS['],
-  }
-  for (const a of NEW_ANCHORS) hints[a.name] = a.hints
+  // 全部报出来，别让用户改完一处再撞下一处
   const problems = Object.entries(counts)
     .filter(([, n]) => n !== 1)
     .map(([name, n]) => `找不到 ${name} 的目标代码块（命中 ${n} 次，期望 1 次）。`
       + '\n上游可能改过这段。实际找到的内容片段：\n'
-      + snippetAround(src, hints[name]))
+      + snippetAround(src, list.find((a) => a.name === name).hints))
   const err = new Error(problems.join('\n\n'))
   err.drift = true
   throw err
 }
 
-function applyPatch(src) {
-  let out = src.replace(ORIGINAL_FENCE, PATCHED_FENCE)
-    .replace(ORIGINAL_DISPATCH, PATCHED_DISPATCH)
-    .replace(ORIGINAL_INJECT, PATCHED_INJECT)
-    .replace(ORIGINAL_SOUND, PATCHED_SOUND)
+function applyPatchFile(src, rel) {
+  let out = src
   // 用函数形式替换：补丁块里若出现 $& / $1 之类，字符串形式会被 String.replace 当替换模式解释
-  for (const a of NEW_ANCHORS) out = out.replace(a.from, () => a.to)
+  for (const a of anchorsFor(rel)) out = out.replace(a.from, () => a.to)
   return out
 }
 
-function reversePatch(src) {
-  let out = src.replace(PATCHED_FENCE, ORIGINAL_FENCE)
-    .replace(PATCHED_DISPATCH, ORIGINAL_DISPATCH)
-    .replace(PATCHED_INJECT, ORIGINAL_INJECT)
-    .replace(PATCHED_SOUND, ORIGINAL_SOUND)
+function reversePatchFile(src, rel) {
+  let out = src
   // 逆序还原，避免前一处还原出的原文被后一处误匹配
-  for (const a of [...NEW_ANCHORS].reverse()) out = out.replace(a.to, () => a.from)
+  for (const a of [...anchorsFor(rel)].reverse()) out = out.replace(a.to, () => a.from)
   return out
 }
 
@@ -1474,135 +1985,204 @@ function syntaxOk(file) {
   }
 }
 
+// 对**内存里的内容**做语法校验（先写临时文件再 node --check），用于"两个文件都验完再落盘"
+function syntaxOkText(text, rel) {
+  const tmp = path.join(os.tmpdir(), `dsh-whale-patch-${process.pid}-${path.basename(rel)}`)
+  try {
+    fs.writeFileSync(tmp, text)
+    return syntaxOk(tmp)
+  } finally {
+    try { fs.unlinkSync(tmp) } catch (err) {}
+  }
+}
+
 // —— 主流程 ——
 
 function readVersion(dir) {
   try { return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version || '未知' } catch (err) { return '未知' }
 }
 
+// 第一阶段：把两个文件都读进来、检查状态、算出新内容、验语法。任何一处失败都不写盘。
+function planPatch(dir) {
+  const plan = []
+  for (const rel of TARGET_FILES) {
+    const file = path.join(dir, rel)
+    if (!fs.existsSync(file)) {
+      return { error: `缺少 ${rel}（${file}）` }
+    }
+    const src = fs.readFileSync(file, 'utf8')
+    let info
+    try { info = inspectFile(src, rel) } catch (err) {
+      return { error: err.message }
+    }
+    if (info.state === 'patched') {
+      plan.push({ rel, file, src, next: src, state: 'patched', added: 0 })
+      continue
+    }
+    const next = applyPatchFile(src, rel)
+    if (next === src) {
+      return { error: `${rel}：替换后内容未变化，说明锚点匹配异常。未写入。` }
+    }
+    const chk = syntaxOkText(next, rel)
+    if (!chk.ok) {
+      return { error: `${rel}：打补丁后 node --check 未通过，未写入。\n${chk.msg}` }
+    }
+    plan.push({
+      rel, file, src, next, state: 'original',
+      added: next.split('\n').length - src.split('\n').length,
+    })
+  }
+  return { plan }
+}
+
 function doPatch(dir, opts) {
-  const file = path.join(dir, TARGET_REL)
-  const backup = path.join(dir, BACKUP_REL)
   const version = readVersion(dir)
   console.log(`\n插件目录：${dir}`)
   console.log(`上游版本：${PKG}@${version}`)
+  console.log(`目标文件：${TARGET_FILES.join(' + ')}`)
 
-  if (!fs.existsSync(file)) {
-    console.error(`缺少 ${file}`)
-    return 1
-  }
-  const src = fs.readFileSync(file, 'utf8')
-
-  let info
-  try { info = inspect(src) } catch (err) {
-    console.error(`\n失败：${err.message}`)
+  const planned = planPatch(dir)
+  if (planned.error) {
+    console.error(`\n失败：${planned.error}`)
     console.error('\n未写入任何文件。')
     return 1
   }
+  const { plan } = planned
 
-  if (info.state === 'patched') {
+  let pending = 0
+  for (const p of plan) {
+    if (p.state === 'patched') {
+      console.log(`  ${p.rel}：已是最新（${MARK_COUNT[p.rel]} 处锚点全部在位），无需改动。`)
+    } else {
+      pending++
+      console.log(`  ${p.rel}：待打补丁（${MARK_COUNT[p.rel]} 处锚点，将新增 ${p.added} 行）`)
+    }
+  }
+  if (pending === 0) {
     console.log('状态：已是最新（补丁已在位），无需改动。')
     return 0
   }
-
-  const next = applyPatch(src)
-  if (next === src) {
-    console.error('失败：替换后内容未变化，说明锚点匹配异常。未写入。')
-    return 1
-  }
-  const added = next.split('\n').length - src.split('\n').length
-  console.log(`状态：待打补丁（将新增 ${added} 行）`)
 
   if (opts.check) {
     console.log('--check：只报告，不写文件。')
     return 0
   }
 
-  // 备份（已存在则不覆盖，保留最早的原始副本）
-  if (fs.existsSync(backup)) {
-    console.log(`备份：${BACKUP_REL} 已存在，保留不覆盖。`)
-  } else {
-    fs.writeFileSync(backup, src)
-    console.log(`备份：已写入 ${BACKUP_REL}`)
+  // 第二阶段：备份 + 落盘（两个文件都验过了，这里只做 IO）
+  for (const p of plan) {
+    if (p.state === 'patched') continue
+    const backup = path.join(dir, backupRel(p.rel))
+    // 已存在则不覆盖，保留最早的原始副本
+    if (fs.existsSync(backup)) {
+      console.log(`备份：${backupRel(p.rel)} 已存在，保留不覆盖。`)
+    } else {
+      fs.writeFileSync(backup, p.src)
+      console.log(`备份：已写入 ${backupRel(p.rel)}`)
+    }
+    fs.writeFileSync(p.file, p.next)
+    const chk = syntaxOk(p.file)
+    if (!chk.ok) {
+      fs.writeFileSync(p.file, p.src)
+      console.error(`失败：${p.rel} 落盘后 node --check 未通过，已回滚到原内容。`)
+      console.error(chk.msg)
+      return 1
+    }
+    console.log(`语法：${p.rel} node --check 通过`)
   }
-
-  fs.writeFileSync(file, next)
-  const chk = syntaxOk(file)
-  if (!chk.ok) {
-    fs.writeFileSync(file, src)
-    console.error('失败：node --check 未通过，已回滚到原内容。')
-    console.error(chk.msg)
-    return 1
-  }
-  console.log('语法：node --check 通过')
   console.log('完成：补丁已应用。重启 dsh 后生效。')
   return 0
 }
 
+// 第一阶段：算出每个文件要还原成什么。任何一处失败都不写盘。
+function planRevert(dir) {
+  const plan = []
+  for (const rel of TARGET_FILES) {
+    const file = path.join(dir, rel)
+    if (!fs.existsSync(file)) {
+      return { error: `缺少 ${rel}（${file}）` }
+    }
+    const src = fs.readFileSync(file, 'utf8')
+    const backup = path.join(dir, backupRel(rel))
+
+    // 先看当前状态：本来就是原版就直接收工，别把备份再写一遍
+    let current = null
+    try { current = inspectFile(src, rel) } catch (err) { current = null }
+    if (current && current.state === 'original') {
+      plan.push({ rel, file, src, target: src, how: null, state: 'original' })
+      continue
+    }
+
+    let target = null
+    let how = ''
+    if (fs.existsSync(backup)) {
+      const bak = fs.readFileSync(backup, 'utf8')
+      // 备份必须是"未打补丁"的原版，否则不用它（避免把别的状态写回去）
+      let bakClean = false
+      try { bakClean = inspectFile(bak, rel).state === 'original' } catch (err) { bakClean = false }
+      if (bakClean) { target = bak; how = `备份文件 ${backupRel(rel)} ` }
+    }
+    if (target === null) {
+      let info
+      try { info = inspectFile(src, rel) } catch (err) {
+        return { error: err.message }
+      }
+      if (info.state === 'original') {
+        plan.push({ rel, file, src, target: src, how: null, state: 'original' })
+        continue
+      }
+      target = reversePatchFile(src, rel)
+      how = '反向替换'
+      if (target === src) {
+        return { error: `${rel}：反向替换未产生变化。未写入。` }
+      }
+    }
+    const chk = syntaxOkText(target, rel)
+    if (!chk.ok) {
+      return { error: `${rel}：还原后 node --check 未通过，未写入。\n${chk.msg}` }
+    }
+    plan.push({ rel, file, src, target, how, state: 'patched' })
+  }
+  return { plan }
+}
+
 function doRevert(dir, opts) {
-  const file = path.join(dir, TARGET_REL)
-  const backup = path.join(dir, BACKUP_REL)
   const version = readVersion(dir)
   console.log(`\n插件目录：${dir}`)
   console.log(`上游版本：${PKG}@${version}`)
+  console.log(`目标文件：${TARGET_FILES.join(' + ')}`)
 
-  if (!fs.existsSync(file)) {
-    console.error(`缺少 ${file}`)
+  const planned = planRevert(dir)
+  if (planned.error) {
+    console.error(`\n失败：${planned.error}`)
+    console.error('\n未写入任何文件。')
     return 1
   }
-  const src = fs.readFileSync(file, 'utf8')
+  const { plan } = planned
 
-  // 先看当前状态：本来就是原版就直接收工，别把备份再写一遍
-  let current = null
-  try { current = inspect(src) } catch (err) { current = null }
-  if (current && current.state === 'original') {
+  const todo = plan.filter((p) => p.state === 'patched')
+  if (todo.length === 0) {
     console.log('状态：本来就是原版（补丁不在位），无需还原。')
     return 0
   }
-
-  let target = null
-  let how = ''
-  if (fs.existsSync(backup)) {
-    const bak = fs.readFileSync(backup, 'utf8')
-    // 备份必须是"未打补丁"的原版，否则不用它（避免把别的状态写回去）
-    let bakClean = false
-    try { bakClean = inspect(bak).state === 'original' } catch (err) { bakClean = false }
-    if (bakClean) { target = bak; how = `备份文件 ${BACKUP_REL} ` }
-  }
-  if (target === null) {
-    let info
-    try { info = inspect(src) } catch (err) {
-      console.error(`\n失败：${err.message}`)
-      console.error('\n未写入任何文件。')
-      return 1
-    }
-    if (info.state === 'original') {
-      console.log('状态：本来就是原版（补丁不在位），无需还原。')
-      return 0
-    }
-    target = reversePatch(src)
-    how = '反向替换'
-    if (target === src) {
-      console.error('失败：反向替换未产生变化。未写入。')
-      return 1
-    }
-  }
+  for (const p of todo) console.log(`  ${p.rel}：将用${p.how}还原`)
 
   if (opts.check) {
-    console.log(`--check：将用${how}还原，不写文件。`)
+    console.log('--check：只报告，不写文件。')
     return 0
   }
 
-  fs.writeFileSync(file, target)
-  const chk = syntaxOk(file)
-  if (!chk.ok) {
-    fs.writeFileSync(file, src)
-    console.error('失败：还原后 node --check 未通过，已回滚。')
-    console.error(chk.msg)
-    return 1
+  for (const p of todo) {
+    fs.writeFileSync(p.file, p.target)
+    const chk = syntaxOk(p.file)
+    if (!chk.ok) {
+      fs.writeFileSync(p.file, p.src)
+      console.error(`失败：${p.rel} 还原后 node --check 未通过，已回滚。`)
+      console.error(chk.msg)
+      return 1
+    }
+    console.log(`还原：已用${p.how}还原 ${p.rel}`)
+    console.log(`语法：${p.rel} node --check 通过`)
   }
-  console.log(`还原：已用${how}还原 ${TARGET_REL}`)
-  console.log('语法：node --check 通过')
   return 0
 }
 
