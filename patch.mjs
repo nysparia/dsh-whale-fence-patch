@@ -3,7 +3,7 @@
 //
 // 改**两个**文件：
 //
-// 【lib/index.js】十组（共 30 个锚点）：
+// 【lib/index.js】十一组（共 31 个锚点）：
 //   ① connectionFence()           —— 栅栏兼容（DSH >= 0.2.2-rc.2 的 admit）
 //   ② rejected() 的栅栏分派        —— 同上
 //   ③ root.inject 列表             —— 补 connection.authentication，否则 admit 恒抛
@@ -14,6 +14,7 @@
 //   ⑧ 配置文件损坏备份              —— backupCorruptFile + 四个读取函数
 //   ⑨ waitState 跨会话状态污染       —— 按会话分桶 + waitView() 选一个会话上报（子 agent 不再清主会话挂起）
 //   ⑩ 账本 IO 退避 + update-check 去重 —— Atomics.wait 退避 305ms→25ms；并发只打一轮上游
+//   ⑬ 账本 accounting.books[*].days 无限增长 —— 与 history 同口径保留 365 天并归档；空本整本删（active 除外）
 //
 // 【assets/whale-widget.js】两组（共 15 个锚点）：
 //   ⑪ issue #339：onDocPointerMoveCursor 每次 pointermove 都强制同步布局
@@ -1174,6 +1175,170 @@ const PATCHED_UPDATE_CHECK = `    let updateCheckCache = null
       }
     }`
 
+// ⑬ 账本 accounting.books[*].days 无限增长
+// pruneLedgerUsage() 只清 events（90 天 / 2 万条）与 history（365 天），完全不碰
+// accounting.books[*].days —— 而 observeBalance() 每天往 books[scope-currency].days[day]
+// 写一行（约 183 字节），scope 是 API key 的 sha256 前 24 位（换一次 key 就多一本）。
+// 单本 1 年约 77KB、5 年约 383KB，多本乘多年成倍放大，而 readUsageLedger() 每个请求
+// 都要 JSON.parse 整个文件。补丁：books[*].days 与 history 同口径保留 365 天并归档；
+// 清空后的非 active 本整本删掉（active 本永远保留，否则 balanceSummary 全挂）；
+// 归档写盘失败时一行都不删。
+const ORIGINAL_PRUNE_BOOKS = `    // 返回 true 表示账本被裁剪过（调用方随后写盘即可）
+    function pruneLedgerUsage(led) {
+      try {
+        const ev = Array.isArray(led.events) ? led.events : []
+        const hist = (led.history && typeof led.history === 'object') ? led.history : {}
+        const dateCut90 = dayAdd(todayKey(), -90)
+        const dateCut365 = dayAdd(todayKey(), -365)
+        const keepEv = []
+        const dropEv = []
+        for (const e of ev) {
+          const day = String((e && e.day) || '')
+          if (day && day < dateCut90) dropEv.push(e)
+          else keepEv.push(e)
+        }
+        if (keepEv.length > 20000) {
+          const extra = keepEv.length - 20000
+          for (const e of keepEv.splice(0, extra)) dropEv.push(e)
+        }
+        const dropHist = {}
+        let histDropped = 0
+        for (const day of Object.keys(hist)) {
+          if (String(day) < dateCut365) {
+            dropHist[day] = hist[day]
+            delete hist[day]
+            histDropped++
+          }
+        }
+        if (!dropEv.length && !histDropped) return false
+        const ar = readUsageArchive()
+        ar.events = Array.isArray(ar.events) ? ar.events : []
+        for (const e of dropEv) ar.events.push(e)
+        if (ar.events.length > 200000) ar.events.splice(0, ar.events.length - 200000)
+        ar.history = Object.assign({}, ar.history || {}, dropHist)
+        ar.updatedAt = new Date().toISOString()
+        ar.note = '小鲸鱼记账归档：events 超 90 天或超 2 万条、history 超 365 天的部分'
+        try { fs.writeFileSync(usageArchivePath(), JSON.stringify(ar), 'utf8') } catch (err) { return false }
+        led.events = keepEv
+        led.history = hist
+        return true
+      } catch (err) { return false }
+    }
+`
+
+const PATCHED_PRUNE_BOOKS = `    // 返回 true 表示账本被裁剪过（调用方随后写盘即可）
+    function pruneLedgerUsage(led) {
+      try {
+        const ev = Array.isArray(led.events) ? led.events : []
+        const hist = (led.history && typeof led.history === 'object') ? led.history : {}
+        const dateCut90 = dayAdd(todayKey(), -90)
+        const dateCut365 = dayAdd(todayKey(), -365)
+        const keepEv = []
+        const dropEv = []
+        for (const e of ev) {
+          const day = String((e && e.day) || '')
+          if (day && day < dateCut90) dropEv.push(e)
+          else keepEv.push(e)
+        }
+        if (keepEv.length > 20000) {
+          const extra = keepEv.length - 20000
+          for (const e of keepEv.splice(0, extra)) dropEv.push(e)
+        }
+        const dropHist = {}
+        const keepHist = {}
+        let histDropped = 0
+        for (const day of Object.keys(hist)) {
+          if (String(day) < dateCut365) {
+            dropHist[day] = hist[day]
+            histDropped++
+          } else {
+            keepHist[day] = hist[day]
+          }
+        }
+        // —— accounting.books[*].days 的保留策略（v800）：与 history 同为 365 天 ——
+        // 为什么必须清：observeBalance() 每天往 books[scope-currency].days[day] 写一行（实测 183 字节），
+        // 而 scope 是 API key 的 sha256 前 24 位 —— 换一次 key 就多一本。旧版只清 events/history，
+        // books 完全不碰：整份账本 JSON 单本 1 年约 77KB、5 年约 383KB，多本乘多年成倍放大，
+        // 而 readUsageLedger() 每个请求都要 JSON.parse 整个文件（balance.json / usage-records.json / about.json）。
+        // 两条规则：
+        //   · 超过 365 天的日行删掉并归档（与 history 一致，不丢历史，只是移出主账本）；
+        //   · 清空后的本整本删掉，但 a.active 那本永远保留 —— currentBook() 只认 a.active，
+        //     删了它 balanceSummary() 返回 null，余额面板全挂。
+        // legacyHistory 不在这里清：它只在 observeBalance() 迁移时写一次（history 的快照），
+        // 不随天数增长，清掉反而会让旧日期从「旧版记录」退化成「本地估算」。
+        const a = led.accounting
+        const books = (a && typeof a === 'object' && a.version === 1
+          && a.books && typeof a.books === 'object' && !Array.isArray(a.books)) ? a.books : null
+        const dropBooks = {} // scope -> { currency, days: { 被删的日行 } }
+        const dropBookMeta = [] // 整本删掉的 scope（days 已空且不是 active）
+        let bookDaysDropped = 0
+        if (books) {
+          for (const scope of Object.keys(books)) {
+            const book = books[scope]
+            if (!book || typeof book !== 'object') continue
+            const days = book.days
+            if (!days || typeof days !== 'object' || Array.isArray(days)) continue
+            const dropped = {}
+            let kept = 0
+            for (const day of Object.keys(days)) {
+              if (String(day) < dateCut365) {
+                dropped[day] = days[day]
+                bookDaysDropped++
+              } else {
+                kept++
+              }
+            }
+            if (Object.keys(dropped).length) dropBooks[scope] = { currency: book.currency, days: dropped }
+            if (!kept && scope !== a.active) {
+              dropBookMeta.push({ scope, currency: book.currency, lastAt: book.lastAt })
+            }
+          }
+        }
+        if (!dropEv.length && !histDropped && !bookDaysDropped) return false
+        const ar = readUsageArchive()
+        ar.events = Array.isArray(ar.events) ? ar.events : []
+        for (const e of dropEv) ar.events.push(e)
+        if (ar.events.length > 200000) ar.events.splice(0, ar.events.length - 200000)
+        ar.history = Object.assign({}, ar.history || {}, dropHist)
+        if (bookDaysDropped) {
+          const arc = (ar.accounting && typeof ar.accounting === 'object' && !Array.isArray(ar.accounting)) ? ar.accounting : {}
+          const arcBooks = (arc.books && typeof arc.books === 'object' && !Array.isArray(arc.books)) ? arc.books : {}
+          for (const scope of Object.keys(dropBooks)) {
+            const tgt = (arcBooks[scope] && typeof arcBooks[scope] === 'object') ? arcBooks[scope] : (arcBooks[scope] = {})
+            tgt.currency = dropBooks[scope].currency
+            tgt.days = Object.assign({}, tgt.days || {}, dropBooks[scope].days)
+          }
+          arc.books = arcBooks
+          if (dropBookMeta.length) {
+            arc.removedBooks = Array.isArray(arc.removedBooks) ? arc.removedBooks : []
+            for (const m of dropBookMeta) {
+              arc.removedBooks.push({ scope: m.scope, currency: m.currency, lastAt: m.lastAt, removedAt: Date.now() })
+            }
+            if (arc.removedBooks.length > 2000) arc.removedBooks.splice(0, arc.removedBooks.length - 2000)
+          }
+          ar.accounting = arc
+        }
+        ar.updatedAt = new Date().toISOString()
+        ar.note = '小鲸鱼记账归档：events 超 90 天或超 2 万条、history 超 365 天、accounting.books[*].days 超 365 天的部分'
+        // 先落盘再改内存：归档写失败就原样返回 false，绝不出现「删了但没归档」
+        try { fs.writeFileSync(usageArchivePath(), JSON.stringify(ar), 'utf8') } catch (err) { return false }
+        led.events = keepEv
+        led.history = keepHist
+        if (books) {
+          for (const scope of Object.keys(dropBooks)) {
+            const days = books[scope] && books[scope].days
+            if (!days || typeof days !== 'object') continue
+            for (const day of Object.keys(dropBooks[scope].days)) delete days[day]
+          }
+          for (const m of dropBookMeta) delete books[m.scope]
+        }
+        return true
+      } catch (err) { return false }
+    }
+`
+
+const MARK_PRUNE_BOOKS = `let bookDaysDropped = 0`
+
 const NEW_ANCHORS = [
   {
     name: 'body 超限 413（readBodyLimited）',
@@ -1303,6 +1468,11 @@ const NEW_ANCHORS = [
     name: 'update-check 并发 in-flight 去重',
     from: ORIGINAL_UPDATE_CHECK, to: PATCHED_UPDATE_CHECK, mark: 'let updateCheckInFlight = null',
     hints: ['let updateCheckCache = null', 'Promise.all(UPDATE_SOURCES', 'update-check.json'],
+  },
+  {
+    name: "账本 accounting.books[*].days 无限增长",
+    from: ORIGINAL_PRUNE_BOOKS, to: PATCHED_PRUNE_BOOKS, mark: MARK_PRUNE_BOOKS,
+    hints: ["function pruneLedgerUsage(led)", "ar.history = Object.assign({}, ar.history || {}, dropHist)", "usageArchivePath()"],
   },
 
 ]

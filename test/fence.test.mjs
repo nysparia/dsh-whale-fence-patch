@@ -910,3 +910,193 @@ test('waitState：源码里不再有全局单槽 waitState 对象', () => {
   assert.ok(!/waitState\.pending = /.test(src), '不应再有对全局 waitState.pending 的写入')
   assert.ok(!/waitState\.sessionName = /.test(src), '不应再有对全局 waitState.sessionName 的写入')
 })
+
+// ===== 第十三组：账本 accounting.books[*].days 无限增长（v800）=====
+// 上游 pruneLedgerUsage() 只清 events（90 天 / 2 万条）与 history（365 天），完全不碰
+// accounting.books[*].days —— 而 observeBalance() 每天往 books[scope-currency].days[day]
+// 写一行（约 183 字节），scope 是 API key 的 sha256 前 24 位（换一次 key 就多一本）。
+// 这里从**打过补丁的源码**里抽出真实函数跑行为断言。
+
+// 日期口径：优先用插件自带的 lib/accounting.mjs（与运行时同一份实现）；
+// 插件目录里没有它时退回本地等价实现（beijingDay = UTC+8 的 YYYY-MM-DD）。
+let beijingDay
+let dayOffset
+try {
+  const acc = await import(new URL('file://' + path.join(pluginDir, 'lib', 'accounting.mjs')).href)
+  beijingDay = acc.beijingDay
+  dayOffset = acc.dayOffset
+} catch (err) {
+  beijingDay = (time = Date.now()) => new Date(Number(time) + 8 * 3600000).toISOString().slice(0, 10)
+  dayOffset = (day, offset) => beijingDay(Date.parse(day + 'T00:00:00+08:00') + offset * 86400000)
+}
+
+function buildPruneHarness(opts = {}) {
+  const code = [
+    extractFnSafe(src, 'usageArchivePath'),
+    extractFnSafe(src, 'readUsageArchive'),
+    extractFnSafe(src, 'pruneLedgerUsage'),
+  ].join('\n')
+  const factory = new Function(
+    'fs', 'path', 'DSH_HOME', 'USAGE_FILE_CANDIDATES', 'todayKey', 'dayAdd', 'console',
+    `${code}
+return { pruneLedgerUsage, usageArchivePath, readUsageArchive }`,
+  )
+  return factory(
+    opts.fs || fs, path, opts.home, opts.candidates,
+    () => beijingDay(), (d, n) => dayOffset(d, n), opts.console || console,
+  )
+}
+
+function pruneTmpHome(tag) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dshw-prune-' + tag + '-'))
+  return { dir, candidates: [path.join(dir, '.dshw-usage.json')] }
+}
+
+// 400 天账本：days 从 today-399 到 today
+function makeBooksLedger(days = 400, scopes = ['scopeA-CNY']) {
+  const today = beijingDay()
+  const books = {}
+  for (const scope of scopes) {
+    const d = {}
+    for (let i = days - 1; i >= 0; i--) {
+      const day = dayOffset(today, -i)
+      d[day] = {
+        day, firstAt: Date.parse(day + 'T00:00:00+08:00') + 60000,
+        lastAt: Date.parse(day + 'T00:00:00+08:00') + 3600000,
+        openingUnits: 1000000000, lastUnits: 999000000,
+        debitUnits: 1000000, creditUnits: 0, revision: 0, correction: null,
+      }
+    }
+    books[scope] = { currency: 'CNY', days: d, lastAt: Date.parse(today + 'T00:00:00+08:00') + 3600000 }
+  }
+  const history = {}
+  for (let i = days - 1; i >= 0; i--) history[dayOffset(today, -i)] = 0.01
+  return {
+    date: today, dayStart: 10, lastBalance: 9.99, todayUsage: 0.01,
+    events: [], history,
+    accounting: { version: 1, active: scopes[0], books, migratedAt: 1, legacyHistory: { '2000-01-01': 1 } },
+  }
+}
+
+const pruneCountDays = (led) => Object.values(led.accounting.books)
+  .reduce((n, b) => n + Object.keys(b.days || {}).length, 0)
+
+test('pruneLedgerUsage：400 天账本的 books[*].days 被裁到 365 天窗口（366 个日历日，含首尾）', () => {
+  const { dir, candidates } = pruneTmpHome('main')
+  const h = buildPruneHarness({ home: dir, candidates })
+  const led = makeBooksLedger(400)
+  assert.equal(pruneCountDays(led), 400, '构造后应有 400 行')
+  assert.equal(h.pruneLedgerUsage(led), true, '有东西被裁时必须返回 true')
+  assert.equal(pruneCountDays(led), 366, `books.days 应剩 366 行，实际 ${pruneCountDays(led)}`)
+  // 与 history 同口径：cutoff = today-365，删 day < cutoff
+  assert.equal(Object.keys(led.history).length, 366, 'history 与 books.days 必须同口径')
+  const cut = dayOffset(beijingDay(), -365)
+  for (const book of Object.values(led.accounting.books)) {
+    for (const day of Object.keys(book.days)) assert.ok(day >= cut, `残留超期行 ${day}`)
+  }
+  assert.equal(led.accounting.legacyHistory['2000-01-01'], 1, 'legacyHistory 不参与裁剪')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('pruneLedgerUsage：被删的日行归档到 .dshw-usage-archive.json', () => {
+  const { dir, candidates } = pruneTmpHome('archive')
+  const h = buildPruneHarness({ home: dir, candidates })
+  const led = makeBooksLedger(400)
+  h.pruneLedgerUsage(led)
+  const arPath = h.usageArchivePath()
+  assert.ok(fs.existsSync(arPath), '归档文件必须生成')
+  const ar = JSON.parse(fs.readFileSync(arPath, 'utf8'))
+  const arc = ar.accounting && ar.accounting.books && ar.accounting.books['scopeA-CNY']
+  assert.ok(arc && arc.days, '归档里必须有 accounting.books[scope].days')
+  assert.equal(Object.keys(arc.days).length, 34, `应归档 34 行，实际 ${Object.keys(arc.days).length}`)
+  const oldest = dayOffset(beijingDay(), -399)
+  assert.equal(arc.days[oldest].debitUnits, 1000000, '归档行必须是完整行，不能只留日期')
+  assert.ok(typeof ar.note === 'string' && ar.note.includes('books'), 'note 必须写清归档了什么')
+  assert.ok(Array.isArray(ar.events) && ar.history && typeof ar.history === 'object',
+    '不能破坏已有的 events / history 字段')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('pruneLedgerUsage：清空后的非 active 本整本删掉，active 本即使空了也保留', () => {
+  const { dir, candidates } = pruneTmpHome('empty')
+  const h = buildPruneHarness({ home: dir, candidates })
+  const today = beijingDay()
+  const stale = (n) => {
+    const d = {}
+    for (let i = 0; i < n; i++) {
+      const day = dayOffset(today, -400 - i)
+      d[day] = { day, firstAt: 1, lastAt: 2, openingUnits: 1, lastUnits: 1, debitUnits: 0, creditUnits: 0, revision: 0, correction: null }
+    }
+    return d
+  }
+  const led = {
+    date: today, events: [], history: {},
+    accounting: {
+      version: 1, active: 'active-CNY', migratedAt: 1,
+      books: {
+        'active-CNY': { currency: 'CNY', days: stale(3), lastAt: 1 },
+        'oldkey-CNY': { currency: 'CNY', days: stale(5), lastAt: 1 },
+      },
+    },
+  }
+  assert.equal(h.pruneLedgerUsage(led), true)
+  assert.ok(!('oldkey-CNY' in led.accounting.books), '非 active 的空本必须整本删掉')
+  assert.ok('active-CNY' in led.accounting.books, 'active 本必须保留（否则 balanceSummary 全挂）')
+  assert.equal(Object.keys(led.accounting.books['active-CNY'].days).length, 0)
+  const ar = JSON.parse(fs.readFileSync(h.usageArchivePath(), 'utf8'))
+  assert.ok(Array.isArray(ar.accounting.removedBooks)
+    && ar.accounting.removedBooks.some((m) => m.scope === 'oldkey-CNY'), '被删整本的 scope 要记进归档')
+  assert.equal(Object.keys(ar.accounting.books['oldkey-CNY'].days).length, 5, '被删整本的日行也要归档')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('pruneLedgerUsage：accounting 缺失 / 结构异常时跳过，不抛错', () => {
+  const { dir, candidates } = pruneTmpHome('bad')
+  const h = buildPruneHarness({ home: dir, candidates })
+  const today = beijingDay()
+  const cases = [
+    ['accounting 缺失', { date: today, events: [], history: {} }],
+    ['accounting 是 null', { date: today, events: [], history: {}, accounting: null }],
+    ['版本不对', { date: today, events: [], history: {}, accounting: { version: 2, active: 'x', books: { x: { days: { '2000-01-01': {} } } } } }],
+    ['books 是数组', { date: today, events: [], history: {}, accounting: { version: 1, active: 'x', books: [1, 2] } }],
+    ['books 是字符串', { date: today, events: [], history: {}, accounting: { version: 1, active: 'x', books: 'nope' } }],
+    ['days 不是对象', { date: today, events: [], history: {}, accounting: { version: 1, active: 'x', books: { x: { days: 'nope' }, y: { days: null } } } }],
+    ['book 本身是 null', { date: today, events: [], history: {}, accounting: { version: 1, active: 'x', books: { x: null, y: 5 } } }],
+  ]
+  for (const [label, led] of cases) {
+    let ret
+    assert.doesNotThrow(() => { ret = h.pruneLedgerUsage(led) }, `${label} 不能抛错`)
+    assert.equal(ret, false, `${label} 应返回 false`)
+  }
+  // books 异常不能连累 events 的清理
+  const led2 = { date: today, events: [{ day: '2000-01-01', cost: 1 }], history: {}, accounting: { version: 1, active: 'x', books: 'nope' } }
+  assert.equal(h.pruneLedgerUsage(led2), true)
+  assert.equal(led2.events.length, 0, 'books 异常时 events 仍应被清理')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('pruneLedgerUsage：归档写盘失败时返回 false 且一行都不删', () => {
+  const { dir, candidates } = pruneTmpHome('fail')
+  const failingFs = {
+    accessSync: () => {},
+    readFileSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) },
+    writeFileSync: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }) },
+  }
+  const h = buildPruneHarness({ home: dir, candidates, fs: failingFs })
+  const led = makeBooksLedger(400)
+  const beforeDays = pruneCountDays(led)
+  const beforeHist = Object.keys(led.history).length
+  assert.equal(h.pruneLedgerUsage(led), false, '归档写失败必须返回 false')
+  assert.equal(pruneCountDays(led), beforeDays, 'books.days 不能删')
+  assert.equal(Object.keys(led.history).length, beforeHist, 'history 不能删')
+  assert.ok(!fs.existsSync(path.join(dir, '.dshw-usage-archive.json')), '不该留下半截归档')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('pruneLedgerUsage：源码里确实处理了 accounting.books（防止锚点被回退）', () => {
+  const fn = extractFnSafe(src, 'pruneLedgerUsage')
+  assert.ok(fn.includes('led.accounting'), 'pruneLedgerUsage 必须读 led.accounting')
+  assert.ok(fn.includes('bookDaysDropped'), 'pruneLedgerUsage 必须统计被删的日行')
+  assert.ok(/scope !== a\.active/.test(fn), '必须显式保护 active 本')
+  assert.ok(fn.includes('ar.accounting'), '必须把日行归档进 ar.accounting')
+})

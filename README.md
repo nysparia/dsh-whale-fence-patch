@@ -2,7 +2,7 @@
 
 > **社区补丁，非上游官方。** 上游 `dsh-whale-widget` 自 0.4.2（2026-10-11）起没有新版本，本仓库是第三方临时方案。上游修复后请卸载。
 
-给已安装的 [`dsh-whale-widget`](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) 打上游 bug 的补丁，共十二组，落在**两个文件**上：`lib/index.js`（宿主侧，①~⑩）与 `assets/whale-widget.js`（前端侧，⑪ ⑫）。
+给已安装的 [`dsh-whale-widget`](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) 打上游 bug 的补丁，共十三组，落在**两个文件**上：`lib/index.js`（宿主侧，①~⑩ 与 ⑬）与 `assets/whale-widget.js`（前端侧，⑪ ⑫）。
 
 | # | 修的问题 | 锚点数 | 净增行 |
 |---|---|---|---|
@@ -16,8 +16,9 @@
 | ⑩ | **账本 IO 退避阻塞事件循环 + update-check 并发打爆上游** —— `Atomics.wait` 退避最坏 305ms 卡住宿主；8 并发发起 8 轮上游 | 2 | +42 |
 | ⑪ | **`onDocPointerMoveCursor` 每次 pointermove 都强制同步布局**（issue #339）—— `elementFromPoint` + `getBoundingClientRect` + `getImageData(1,1)` 三连，滚动/移动鼠标就卡 | 12 | +116 |
 | ⑫ | **每秒轮询无 in-flight 守卫、页面隐藏时不暂停**（issue #342）—— 响应慢于 1 秒时请求堆叠；后台仍 2 req/s | 3 | +0 |
+| ⑬ | **账本 `accounting.books[*].days` 无限增长** —— `pruneLedgerUsage()` 只清 `events`/`history`，日行永不回收；换一次 API key 多一本，多本 × 多年成倍放大 | 1 | +68 |
 
-共 **45 个锚点**（`lib/index.js` 30 个 + `assets/whale-widget.js` 15 个）。① ② ③ 是同一组（栅栏），④ 与栅栏无关，⑤~⑩ 是另外六个独立 bug，⑪ ⑫ 是前端侧的两个性能 bug。
+共 **46 个锚点**（`lib/index.js` 31 个 + `assets/whale-widget.js` 15 个）。① ② ③ 是同一组（栅栏），④ 与栅栏无关，⑤~⑩ 与 ⑬ 是另外七个独立 bug，⑪ ⑫ 是前端侧的两个性能 bug。
 
 **本仓库不包含上游的任何代码或素材**，只有一个改写脚本（`patch.mjs`）和它的测试。脚本就地修改你机器上已经装好的那份上游副本，素材仍然用上游的。
 
@@ -448,6 +449,83 @@ $ node diag/waitstate-e2e-module.mjs  # 加载真实模块跑真实注册路径�
 变异测试（把 `st.pending = null` 改回"清所有会话"）：4 条用例变红，说明用例真的咬得住。
 
 
+## 第十三处：账本 `accounting.books[*].days` 无限增长
+
+### 症状
+
+慢性劣化，不是崩溃：用久了 `balance.json` / `usage-records.json` / `about.json` 越来越慢。账本文件只增不减。
+
+### 根因
+
+`pruneLedgerUsage()` 只清 `led.events`（90 天 / 2 万条）与 `led.history`（365 天），**完全不碰 `led.accounting.books[*].days`**：
+
+```js
+const dropHist = {}
+for (const day of Object.keys(hist)) {
+  if (String(day) < dateCut365) { dropHist[day] = hist[day]; delete hist[day]; histDropped++ }
+}
+if (!dropEv.length && !histDropped) return false
+```
+
+而 `lib/accounting.mjs` 的 `observeBalance()` 每天往 `books[scope-currency].days[day]` 写一行：
+
+```js
+let row = book.days[day]
+if (!row) {
+  row = book.days[day] = {
+    day, firstAt: at, lastAt: at, openingUnits: units, lastUnits: units,
+    debitUnits: 0, creditUnits: 0, revision: 0, correction: null,
+  }
+}
+```
+
+单日行 JSON 约 **183 字节**。而且 `books` 本身也无限增长 —— `context = scope + '-' + currency`，`scope` 是 API key 的 sha256 前 24 位，**换一次 key 就多一本**。
+
+实测（`diag/ledger-books-prune-check.mjs`，跑在真实源码上）：
+
+```
+旧版：books.days 400 → 400，history 366，返回 true      ← history 清了，books.days 没清
+新版：books.days 400 → 366，history 366，返回 true
+账本 JSON：86267 字节 → 78957 字节
+
+单日行 JSON：183 字节
+3 年 × 1 本：230.2KB → 77.1KB（books.days 1095 → 366）
+5 年 × 1 本：383.4KB → 77.1KB（books.days 1825 → 366）
+5 年 × 4 本：1436.9KB → 288.5KB（books.days 7300 → 1464）
+```
+
+`readUsageLedger()` 每个请求都 `JSON.parse` 整个文件，所以账本越大，三个读端点越慢。
+
+### 修法
+
+在 `pruneLedgerUsage()` 里补上 `books` 的清理，与 `history` 同口径（cutoff = `today-365`，删 `day < cutoff`，即保留 366 个日历日含首尾）：
+
+- 超期日行删掉并归档到 `.dshw-usage-archive.json` 的 `accounting.books[scope].days`；
+- 清空后的本**整本删掉**，但 `a.active` 那本永远保留 —— `currentBook()` 只认 `a.active`，删了它 `balanceSummary()` 返回 `null`，余额面板全挂；
+- 被删整本的 scope 记进 `accounting.removedBooks`（含 `currency` / `lastAt` / `removedAt`，上限 2000 条）；
+- `ar.note` 同步写清归档了什么；已有的 `events` / `history` 字段结构不变。
+
+边界：`led.accounting` 缺失或版本不对、`books` 不是对象、某本 `days` 不是对象 → 跳过，不报错（`events` 的清理照常进行）。
+
+⚠️ 顺带修掉同一函数里的一个既有隐患：旧版在**扫描时**就 `delete hist[day]`，而归档写盘失败只是 `return false` —— 调用方 `appendUsageEvent()` 随后无条件 `writeUsageLedger(led)`，于是"归档没写成、history 却已经被删"的数据丢失路径是真实存在的。现在改成**先落盘再改内存**：归档写失败就一行都不删。
+
+`legacyHistory` 不清：它只在 `observeBalance()` 迁移时写一次（`history` 的快照），不随天数增长；清掉反而会让旧日期从「旧版记录」退化成「本地估算」。
+
+### 验证结果
+
+```
+$ node diag/ledger-books-prune-check.mjs   # 全部通过（含旧版对照）
+$ node test/fence.test.mjs --path <dir>    # 49 通过 / 0 失败（新增 6 条）
+```
+
+端到端（`/tmp/e2e-home`，profile `verify`，端口 31903，400 天 × 3 本夹具，余额接口用本地桩）：
+
+```
+BEFORE（4d517c1，无本次修复）：168110 字节，books.days 810 → 811，history 400 → 366，归档无 accounting 字段
+AFTER （本次修复）           ：152560 字节，books.days 810 → 733，history 400 → 366，归档 16618 字节含 3 本 78 行
+```
+
+
 ## 安装
 
 ```bash
@@ -458,7 +536,7 @@ node patch.mjs --profile web
 
 1. 定位 `~/.dsh/profiles/web/node_modules/dsh-whale-widget`；
 2. 读 `package.json` 打印版本号；
-3. 逐字节匹配上游 0.4.2 的 **45 个锚点**（两个文件各一组），任何一个找不到就**失败退出**（不猜位置）；
+3. 逐字节匹配上游 0.4.2 的 **46 个锚点**（两个文件各一组），任何一个找不到就**失败退出**（不猜位置）；
 4. 备份原文件到 `lib/index.js.bak` / `assets/whale-widget.js.bak`（已存在则不覆盖）；
 5. 写入补丁，跑 `node --check` 验证语法，不通过则回滚。
 
@@ -528,14 +606,23 @@ node test/fence.test.mjs --path ~/.dsh/profiles/web/node_modules/dsh-whale-widge
 - 四个读取函数都调 `backupCorruptFile`，区分 `bad-json` / `bad-structure`，且跳过 `ENOENT`；
 - 四个读取函数里不再有空 `catch (err) {}`。
 
-全部通过时退出 0。共 **34 个测试**（原有 20 + 新增 14）。
+第十三处（账本 `books` 保留策略）同样抽真实函数跑行为断言：
+
+- 400 天账本 → `books[*].days` 裁到 366 行（与 `history` 同口径），`legacyHistory` 不动；
+- 被删的 34 行出现在 `.dshw-usage-archive.json` 的 `accounting.books[scope].days` 里，且是完整行不是只留日期；
+- 清空后的非 active 本整本删掉、active 本即使空了也保留，被删整本记进 `removedBooks`；
+- `accounting` 缺失 / 为 `null` / 版本不对 / `books` 是数组或字符串 / `days` 不是对象 / 本本身是 `null` → 不抛错、返回 `false`，且不连累 `events` 的清理；
+- 归档写盘失败（EACCES）→ 返回 `false` 且 `books.days` / `history` / `events` 一行都不删；
+- 静态断言：`pruneLedgerUsage` 里确实有 `led.accounting` / `bookDaysDropped` / `scope !== a.active` / `ar.accounting`（防止锚点被回退）。
+
+全部通过时退出 0。共 **49 个测试**。
 
 ## 许可与素材声明
 
 - **本仓库不包含上游的任何代码或素材。** 仓库里只有 `patch.mjs`、`test/fence.test.mjs`、文档和许可文件。补丁以字符串常量的形式描述"把哪两段改成什么"，不复制上游文件。
 - 上游 `dsh-whale-widget` 的**代码**（`lib/`、`cordis.patch.yml`、`package.json`、文档）是 MIT。
 - 上游的 **`assets/**`（约 6.6MB 图片 / 动图 / 音效）和 `icon.png` 不在 MIT 覆盖范围内**。上游 `PROVENANCE.md` 写明它们"仅授权随本插件运行使用，不授予再许可"。因此本仓库不重新分发它们 —— 补丁只改用户已安装副本里的 `lib/index.js` 与 `assets/whale-widget.js`（后者是脚本，不是素材），素材仍由那份副本提供。
-- 本补丁改 `lib/index.js`（30 个锚点）与 `assets/whale-widget.js`（15 个锚点）。`lib/index.js` 的 30 个锚点：栅栏三处（净增 24 行）、音效查表一处（净增 13 行）、body 超限十处（净增 21 行）、方法守卫三处（净增 18 行）、节假日两处（净增 32 行）、损坏备份五处（净增 41 行）、waitState 分桶四处（净增 64 行）、账本 IO 退避一处（净增 14 行）、update-check 去重一处（净增 28 行）。
+- 本补丁改 `lib/index.js`（31 个锚点）与 `assets/whale-widget.js`（15 个锚点）。`lib/index.js` 的 31 个锚点：栅栏三处（净增 24 行）、音效查表一处（净增 13 行）、body 超限十处（净增 21 行）、方法守卫三处（净增 18 行）、节假日两处（净增 32 行）、损坏备份五处（净增 41 行）、waitState 分桶四处（净增 64 行）、账本 IO 退避一处（净增 14 行）、update-check 去重一处（净增 28 行）、账本 books 保留策略一处（净增 68 行）。
 
 ## 上游状态
 
@@ -612,7 +699,7 @@ cannot get property "connection.authentication" without inject
 ## 已知限制
 
 - 只在 **DSH 0.2.3-alpha.2** 上端到端验证过。0.2.2-rc.2 到 0.2.3-alpha.2 之间的版本没有逐个验证。
-- 补丁按上游 0.4.2 的代码逐字节匹配 45 个锚点。上游一旦改动其中任何一处，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
+- 补丁按上游 0.4.2 的代码逐字节匹配 46 个锚点。上游一旦改动其中任何一处，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
 - 半打补丁（24 处只命中一部分）会被显式拒绝，并逐处报告哪一处没打上，不会静默写坏文件。
 - 只处理 `lib/index.js` 与 `assets/whale-widget.js` 两个文件。如果上游把栅栏逻辑或前端命中测试挪到别的文件，补丁不适用。
 - 写请求（POST/PUT/PATCH/DELETE）仍然只允许回环来源，这是上游 0.3.15 起的既有策略（`writeRejection`），本补丁没有放宽。远端管理仍需 `DSHW_ADMIN_HOSTS`。
