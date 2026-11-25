@@ -3,7 +3,7 @@
 //
 // 改**两个**文件：
 //
-// 【lib/index.js】十一组（共 31 个锚点）：
+// 【lib/index.js】十二组（共 37 个锚点）：
 //   ① connectionFence()           —— 栅栏兼容（DSH >= 0.2.2-rc.2 的 admit）
 //   ② rejected() 的栅栏分派        —— 同上
 //   ③ root.inject 列表             —— 补 connection.authentication，否则 admit 恒抛
@@ -15,6 +15,8 @@
 //   ⑨ waitState 跨会话状态污染       —— 按会话分桶 + waitView() 选一个会话上报（子 agent 不再清主会话挂起）
 //   ⑩ 账本 IO 退避 + update-check 去重 —— Atomics.wait 退避 305ms→25ms；并发只打一轮上游
 //   ⑬ 账本 accounting.books[*].days 无限增长 —— 与 history 同口径保留 365 天并归档；空本整本删（active 除外）
+//   ⑭ assertSafeApiUrl() 的 SSRF 绕过 —— IPv4-mapped/NAT64 还原、IPv6 回环/ULA/link-local、
+//      私有段、域名 DNS 解析（fail-closed）、重绑定域名；回环默认拒、allowCustomHost 才放行
 //
 // 【assets/whale-widget.js】两组（共 15 个锚点）：
 //   ⑪ issue #339：onDocPointerMoveCursor 每次 pointermove 都强制同步布局
@@ -1339,6 +1341,218 @@ const PATCHED_PRUNE_BOOKS = `    // 返回 true 表示账本被裁剪过（调�
 
 const MARK_PRUNE_BOOKS = `let bookDaysDropped = 0`
 
+
+// —— v816（SSRF 加固）：assertSafeApiUrl 补 IPv4-mapped / IPv6 / 私有段 / 域名解析 ——
+const ORIGINAL_SSRF_GUARD = `    // PR #104（收窄版）：只放行 http/https，并挡掉云厂商元数据与 link-local 地址。
+    // 关键取舍：**不拦回环与内网** —— 我们内置的 ollama 模板就推荐用户填
+    // http://127.0.0.1:11434/v1（本地 Ollama / LM Studio），自建网关（New API 之类，
+    // 见 issue #53）也跑在本机；拦掉它们会把正当用法一起打死。接口地址由用户自己在面板/
+    // 注册表里填写，且所有 /dsh-whale/* 路由都在受信任栅栏之后 —— 真正要挡的是
+    // 「被诱导去读云元数据把凭据带出来」，而不是「访问本机服务」。
+    // decimal / octal / hex 形式的 IPv4 已由 WHATWG URL 规范化成点分十进制，这里只按规范化结果判定。
+    function assertSafeApiUrl(u) {
+      let parsed
+      try { parsed = new URL(u) } catch { throw new Error('无效的接口地址') }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('不支持的协议: ' + parsed.protocol)
+      const host = parsed.hostname.toLowerCase().replace(/^\\[|\\]$/g, '')
+      if (host === 'metadata.google.internal' || host === 'metadata.goog' || host === '100.100.100.200') throw new Error('禁止访问云元数据地址')
+      const m = host.match(/^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/)
+      if (m) {
+        const [a, b] = [Number(m[1]), Number(m[2])]
+        if (a === 169 && b === 254) throw new Error('禁止访问 link-local 地址')
+        if (a === 0) throw new Error('禁止访问该地址')
+      }
+      if (/^fe[89ab][0-9a-f]:/i.test(host)) throw new Error('禁止访问 link-local 地址')
+      // v761（安全修复 S1）：URL 里不允许带 userinfo（\`https://user:pass@host/\`）——
+      // 它是把凭据塞进 URL 的另一种写法，也会让日志/报错里出现凭据
+      if (parsed.username || parsed.password) throw new Error('接口地址不允许携带用户名/密码')
+    }
+`
+
+const PATCHED_SSRF_GUARD = `    // PR #104（收窄版）+ v816（SSRF 加固）：只放行 http/https，并挡掉云厂商元数据、
+    // link-local、私有/保留网段、回环，以及 IPv4-mapped IPv6 等一切"不该被出站请求打到"的地址。
+    // 关键取舍：
+    //   · **回环默认拒绝**，但 \`allowLoopback\`（由 \`model.allowCustomHost === true\` 传入）可放行 ——
+    //     内置 ollama 模板推荐用户填 http://127.0.0.1:11434/v1（本地 Ollama / LM Studio），
+    //     自建网关（New API 之类，见 issue #53）也跑在本机；全禁会把正当用法一起打死。
+    //     而 allowCustomHost **只能由本机（回环）来源的写请求设置**（见 writeRejection），
+    //     所以"远端会话改配置把请求打到 127.0.0.1"这条路仍然堵着。
+    //   · **域名要解析**：DNS 解析出的每个 IP 都要过一遍同样的判定 —— \`169.254.169.254.nip.io\`
+    //     这类重绑定域名在字符串层面看不出来。解析失败一律**拒绝**（fail-closed）：解析不了就不发请求。
+    //   · 残留风险：DNS rebinding 的 TOCTOU **没有解决**。这里解析一次、fetch 内部再解析一次，
+    //     两次之间 DNS 可以变。彻底解决要 pin 住 IP 再连（http.request 的 lookup 选项），
+    //     而插件用的是 fetch，做不到。
+    // decimal / octal / hex 形式的 IPv4 已由 WHATWG URL 规范化成点分十进制，这里只按规范化结果判定。
+    function ipv4Parts(s) {
+      const m = /^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/.exec(String(s))
+      if (!m) return null
+      const p = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])]
+      return p.every((n) => n <= 255) ? p : null
+    }
+    // IPv4 分类：'loopback' | 'blocked' | 'global'
+    function ipv4Class(p) {
+      const [a, b] = p
+      if (a === 127) return 'loopback'                        // 127/8
+      if (a === 0) return 'blocked'                           // 0/8「本网络」
+      if (a === 10) return 'blocked'                          // 10/8
+      if (a === 172 && b >= 16 && b <= 31) return 'blocked'   // 172.16/12
+      if (a === 192 && b === 168) return 'blocked'            // 192.168/16
+      if (a === 169 && b === 254) return 'blocked'            // 169.254/16 link-local（云元数据）
+      if (a === 100 && b >= 64 && b <= 127) return 'blocked'  // 100.64/10 CGNAT
+      return 'global'
+    }
+    // IPv6 展开成 8 个 16 位分组；失败返回 null
+    function ipv6Groups(s) {
+      let str = String(s).toLowerCase()
+      const zi = str.indexOf('%')
+      if (zi >= 0) str = str.slice(0, zi)
+      if (str.indexOf(':') < 0) return null
+      const lastColon = str.lastIndexOf(':')
+      const tail = str.slice(lastColon + 1)
+      if (tail.indexOf('.') >= 0) {
+        const v4 = ipv4Parts(tail)
+        if (!v4) return null
+        str = str.slice(0, lastColon + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+      }
+      const halves = str.split('::')
+      if (halves.length > 2) return null
+      const head = halves[0] ? halves[0].split(':') : []
+      const rest = halves.length === 2 ? (halves[1] ? halves[1].split(':') : []) : []
+      let groups
+      if (halves.length === 2) {
+        const fill = 8 - head.length - rest.length
+        if (fill < 0) return null
+        groups = head.concat(new Array(fill).fill('0'), rest)
+      } else {
+        groups = head
+      }
+      if (groups.length !== 8) return null
+      const out = []
+      for (const g of groups) {
+        if (!/^[0-9a-f]{1,4}$/.test(g)) return null
+        out.push(parseInt(g, 16))
+      }
+      return out
+    }
+    // IPv6 分类：'loopback' | 'blocked' | 'v4'（IPv4-mapped / NAT64，需再按 IPv4 判）| 'global'
+    function ipv6Class(g) {
+      if (g.every((x) => x === 0)) return 'blocked'                            // :: 未指定
+      if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return 'loopback' // ::1
+      if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0xffff) return 'v4' // ::ffff:0:0/96
+      if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0) return 'v4' // 64:ff9b::/96 NAT64
+      if ((g[0] & 0xffc0) === 0xfe80) return 'blocked'                        // fe80::/10 link-local
+      if ((g[0] & 0xfe00) === 0xfc00) return 'blocked'                        // fc00::/7 ULA
+      return 'global'
+    }
+    // 单个 IP（IPv4 点分十进制或 IPv6 字面量）的判定
+    function assertSafeIp(ip, allowLoopback) {
+      const v4 = ipv4Parts(ip)
+      if (v4) {
+        const k = ipv4Class(v4)
+        if (k === 'loopback') { if (!allowLoopback) throw new Error('禁止访问回环地址'); return }
+        if (k === 'blocked') throw new Error('禁止访问内网/保留地址')
+        return
+      }
+      const g = ipv6Groups(ip)
+      if (!g) throw new Error('禁止访问该地址')
+      const k = ipv6Class(g)
+      if (k === 'v4') {
+        const inner = [(g[6] >> 8) & 0xff, g[6] & 0xff, (g[7] >> 8) & 0xff, g[7] & 0xff]
+        const k2 = ipv4Class(inner)
+        if (k2 === 'loopback') { if (!allowLoopback) throw new Error('禁止访问回环地址'); return }
+        if (k2 === 'blocked') throw new Error('禁止访问内网/保留地址')
+        return
+      }
+      if (k === 'loopback') { if (!allowLoopback) throw new Error('禁止访问回环地址'); return }
+      if (k === 'blocked') throw new Error('禁止访问内网/保留地址')
+    }
+    // 重绑定域名（nip.io / sslip.io / xip.io 之类）把目标 IP 直接写在域名里：
+    // \`169.254.169.254.nip.io\`、\`127.0.0.1.nip.io\`。DNS 层被 catch-all 解析器或 TOCTOU
+    // 绕过时，这是唯一还能拦住它们的判据。只在"内嵌的 IPv4 属于禁止段"时才拒 ——
+    // 内嵌公网 IP（\`1.2.3.4.nip.io\`）照常放行，避免误伤。
+    function embeddedIpv4(host) {
+      const labels = String(host).split('.')
+      for (let i = 0; i + 3 < labels.length; i++) {
+        const p = ipv4Parts(labels.slice(i, i + 4).join('.'))
+        if (!p) continue
+        const cls = ipv4Class(p)
+        if (cls !== 'global') return { ip: p.join('.'), cls }
+      }
+      return null
+    }
+    // opts.allowLoopback：是否放行回环（由 model.allowCustomHost === true 传入，默认 false）
+    async function assertSafeApiUrl(u, opts) {
+      const o = opts || {}
+      const allowLoopback = o.allowLoopback === true
+      let parsed
+      try { parsed = new URL(u) } catch { throw new Error('无效的接口地址') }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('不支持的协议: ' + parsed.protocol)
+      // v761（安全修复 S1）：URL 里不允许带 userinfo（\`https://user:pass@host/\`）——
+      // 它是把凭据塞进 URL 的另一种写法，也会让日志/报错里出现凭据
+      if (parsed.username || parsed.password) throw new Error('接口地址不允许携带用户名/密码')
+      const host = parsed.hostname.toLowerCase().replace(/^\\[|\\]$/g, '')
+      if (!host) throw new Error('无效的接口地址')
+      if (host === 'metadata.google.internal' || host === 'metadata.goog' || host === '100.100.100.200') throw new Error('禁止访问云元数据地址')
+      // ① IP 字面量：直接判，不走 DNS（WHATWG 已把 IPv4-mapped 规范化成十六进制形式）
+      if (host.indexOf(':') >= 0 || ipv4Parts(host)) { assertSafeIp(host, allowLoopback); return }
+      // ② 域名里内嵌的禁止段 IPv4（重绑定域名）
+      const emb = embeddedIpv4(host)
+      if (emb) {
+        if (emb.cls === 'loopback') { if (!allowLoopback) throw new Error('禁止访问回环地址') }
+        else throw new Error('禁止访问内网/保留地址')
+      }
+      // ③ 域名：解析出的每个 IP 都要过一遍（fail-closed —— 解析不了就不发请求）
+      let addrs
+      try {
+        addrs = await dns.promises.lookup(host, { all: true, verbatim: true })
+      } catch (err) {
+        throw new Error('无法解析接口地址的域名: ' + host)
+      }
+      if (!Array.isArray(addrs) || !addrs.length) throw new Error('无法解析接口地址的域名: ' + host)
+      for (const a of addrs) assertSafeIp(String((a && a.address) || ''), allowLoopback)
+    }
+`
+
+const ORIGINAL_SSRF_CALLSITE = `      const u = String(url).replace('{key}', key)
+      assertSafeApiUrl(u)
+`
+
+const PATCHED_SSRF_CALLSITE = `      const u = String(url).replace('{key}', key)
+      // v816：assertSafeApiUrl 现在是 async（域名要解析 DNS），回环放行由调用方按
+      // model.allowCustomHost 决定（见 o.allowLoopback）
+      await assertSafeApiUrl(u, o)
+`
+
+const ORIGINAL_SSRF_PROBE = `        const data = await apiFetchJson(url, b.auth, key, { method: b.method, body: b.body, base: base, params: model.params })
+        const bizErr = apiBusinessError(data)
+`
+
+const PATCHED_SSRF_PROBE = `        const data = await apiFetchJson(url, b.auth, key, { method: b.method, body: b.body, base: base, params: model.params, allowLoopback: model.allowCustomHost === true })
+        const bizErr = apiBusinessError(data)
+`
+
+const ORIGINAL_SSRF_QUOTA = `        const data = await apiFetchJson(url, q.auth, key, { method: q.method, body: q.body, base: base, params: model.params })
+        const bizErr = apiBusinessError(data)
+`
+
+const PATCHED_SSRF_QUOTA = `        const data = await apiFetchJson(url, q.auth, key, { method: q.method, body: q.body, base: base, params: model.params, allowLoopback: model.allowCustomHost === true })
+        const bizErr = apiBusinessError(data)
+`
+
+const ORIGINAL_SSRF_BALANCE = `        const data = await apiFetchJson(url, b.auth, key, { method: b.method, body: b.body, base: base, params: model.params })
+        const j = b.json || {}
+`
+
+const PATCHED_SSRF_BALANCE = `        const data = await apiFetchJson(url, b.auth, key, { method: b.method, body: b.body, base: base, params: model.params, allowLoopback: model.allowCustomHost === true })
+        const j = b.json || {}
+`
+
+const ORIGINAL_SSRF_USAGE = `          const d2 = await apiFetchJson(usageUrl, u.auth || b.auth, key)
+`
+
+const PATCHED_SSRF_USAGE = `          const d2 = await apiFetchJson(usageUrl, u.auth || b.auth, key, { allowLoopback: model.allowCustomHost === true })
+`
+
 const NEW_ANCHORS = [
   {
     name: 'body 超限 413（readBodyLimited）',
@@ -1475,6 +1689,36 @@ const NEW_ANCHORS = [
     hints: ["function pruneLedgerUsage(led)", "ar.history = Object.assign({}, ar.history || {}, dropHist)", "usageArchivePath()"],
   },
 
+  {
+    name: "SSRF 防护：assertSafeApiUrl 补 IPv4-mapped / IPv6 / 私有段 / 域名解析",
+    from: ORIGINAL_SSRF_GUARD, to: PATCHED_SSRF_GUARD, mark: "function ipv4Parts(s) {",
+    hints: ["function assertSafeApiUrl(u)","assertSafeApiUrl(u)","fe[89ab]"],
+  },
+  {
+    name: "SSRF 防护：apiFetchJson 调用点改 await",
+    from: ORIGINAL_SSRF_CALLSITE, to: PATCHED_SSRF_CALLSITE, mark: "await assertSafeApiUrl(u, o)",
+    hints: ["assertSafeApiUrl(u)","const u = String(url).replace('{key}', key)"],
+  },
+  {
+    name: "SSRF 防护：探活调用点传 allowLoopback",
+    from: ORIGINAL_SSRF_PROBE, to: PATCHED_SSRF_PROBE, mark: PATCHED_SSRF_PROBE,
+    hints: ["apiFetchJson(url, b.auth, key","apiBusinessError(data)"],
+  },
+  {
+    name: "SSRF 防护：额度调用点传 allowLoopback",
+    from: ORIGINAL_SSRF_QUOTA, to: PATCHED_SSRF_QUOTA, mark: PATCHED_SSRF_QUOTA,
+    hints: ["apiFetchJson(url, q.auth, key","apiBusinessError(data)"],
+  },
+  {
+    name: "SSRF 防护：余额调用点传 allowLoopback",
+    from: ORIGINAL_SSRF_BALANCE, to: PATCHED_SSRF_BALANCE, mark: PATCHED_SSRF_BALANCE,
+    hints: ["apiFetchJson(url, b.auth, key","const j = b.json || {}"],
+  },
+  {
+    name: "SSRF 防护：usage 调用点传 allowLoopback",
+    from: ORIGINAL_SSRF_USAGE, to: PATCHED_SSRF_USAGE, mark: PATCHED_SSRF_USAGE,
+    hints: ["apiFetchJson(usageUrl","credentialMayGoTo(model, tpl, usageUrl)"],
+  },
 ]
 
 // ============================================================================

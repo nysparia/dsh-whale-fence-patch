@@ -2,7 +2,7 @@
 
 > **社区补丁，非上游官方。** 上游 `dsh-whale-widget` 自 0.4.2（2026-10-11）起没有新版本，本仓库是第三方临时方案。上游修复后请卸载。
 
-给已安装的 [`dsh-whale-widget`](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) 打上游 bug 的补丁，共十三组，落在**两个文件**上：`lib/index.js`（宿主侧，①~⑩ 与 ⑬）与 `assets/whale-widget.js`（前端侧，⑪ ⑫）。
+给已安装的 [`dsh-whale-widget`](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) 打上游 bug 的补丁，共十四组，落在**两个文件**上：`lib/index.js`（宿主侧，①~⑩、⑬ 与 ⑭）与 `assets/whale-widget.js`（前端侧，⑪ ⑫）。
 
 | # | 修的问题 | 锚点数 | 净增行 |
 |---|---|---|---|
@@ -17,8 +17,9 @@
 | ⑪ | **`onDocPointerMoveCursor` 每次 pointermove 都强制同步布局**（issue #339）—— `elementFromPoint` + `getBoundingClientRect` + `getImageData(1,1)` 三连，滚动/移动鼠标就卡 | 12 | +116 |
 | ⑫ | **每秒轮询无 in-flight 守卫、页面隐藏时不暂停**（issue #342）—— 响应慢于 1 秒时请求堆叠；后台仍 2 req/s | 3 | +0 |
 | ⑬ | **账本 `accounting.books[*].days` 无限增长** —— `pruneLedgerUsage()` 只清 `events`/`history`，日行永不回收；换一次 API key 多一本，多本 × 多年成倍放大 | 1 | +68 |
+| ⑭ | **SSRF 防护绕过** —— `assertSafeApiUrl()` 注释承诺"禁止访问云元数据"，实际只挡点分十进制 IPv4 的 `169.254/16` 与 `0/8`；IPv4-mapped IPv6、`::1`、ULA、私有段、重绑定域名全部放行 | 6 | +142 |
 
-共 **46 个锚点**（`lib/index.js` 31 个 + `assets/whale-widget.js` 15 个）。① ② ③ 是同一组（栅栏），④ 与栅栏无关，⑤~⑩ 与 ⑬ 是另外七个独立 bug，⑪ ⑫ 是前端侧的两个性能 bug。
+共 **52 个锚点**（`lib/index.js` 37 个 + `assets/whale-widget.js` 15 个）。① ② ③ 是同一组（栅栏），④ 与栅栏无关，⑤~⑩、⑬ 与 ⑭ 是另外八个独立 bug，⑪ ⑫ 是前端侧的两个性能 bug。
 
 **本仓库不包含上游的任何代码或素材**，只有一个改写脚本（`patch.mjs`）和它的测试。脚本就地修改你机器上已经装好的那份上游副本，素材仍然用上游的。
 
@@ -536,7 +537,7 @@ node patch.mjs --profile web
 
 1. 定位 `~/.dsh/profiles/web/node_modules/dsh-whale-widget`；
 2. 读 `package.json` 打印版本号；
-3. 逐字节匹配上游 0.4.2 的 **46 个锚点**（两个文件各一组），任何一个找不到就**失败退出**（不猜位置）；
+3. 逐字节匹配上游 0.4.2 的 **52 个锚点**（两个文件各一组），任何一个找不到就**失败退出**（不猜位置）；
 4. 备份原文件到 `lib/index.js.bak` / `assets/whale-widget.js.bak`（已存在则不覆盖）；
 5. 写入补丁，跑 `node --check` 验证语法，不通过则回滚。
 
@@ -696,13 +697,78 @@ cannot get property "connection.authentication" without inject
 [whale-bubble] 配置文件损坏（bad-json）→ 已备份为 /tmp/final-home/.dshw-bubble.json.corrupt-1795582333903.bak，并用默认结构重建（原文件未删除）
 ```
 
+## 第十四处：SSRF 防护绕过（`assertSafeApiUrl`）
+
+### 症状
+
+`assertSafeApiUrl()` 是插件唯一的出站地址校验，注释写着"挡掉云厂商元数据与 link-local 地址"，但实测 10 个用例里 8 个被放行：
+
+```
+http://169.254.169.254/latest/meta-data/   拒绝(link-local)    ✓
+http://[::ffff:169.254.169.254]/           放行                ✗ 绕过
+http://[::ffff:a9fe:a9fe]/                 放行                ✗ 绕过
+http://169.254.169.254.nip.io/             放行                ✗ 绕过（DNS 重绑定）
+http://127.0.0.1:3080/api/                 放行                ✗ 回环
+http://[::1]/                              放行                ✗ 回环
+http://0.0.0.0/                            拒绝(0.x)           ✓
+http://[fd00::1]/                          放行                ✗ ULA
+http://10.0.0.1/                           放行                ✗ 内网
+http://192.168.1.1/                        放行                ✗ 内网
+```
+
+### 根因
+
+1. IPv4 正则 `/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/` 只匹配点分十进制。`new URL('http://[::ffff:169.254.169.254]/').hostname` 返回 `[::ffff:a9fe:a9fe]`（WHATWG 规范化成十六进制），不匹配。
+2. IPv6 只查了 `fe[89ab]`（link-local），没查 `::1`、`fc00::/7`（ULA）、IPv4-mapped 段。
+3. 域名完全不查 —— `169.254.169.254.nip.io` 解析到 link-local，字符串层面看不出来。
+4. 内网段（`10/8`、`172.16/12`、`192.168/16`、`100.64/10`）完全没查。
+
+### 修法
+
+- **IPv4-mapped / NAT64 还原**：`::ffff:0:0/96` 与 `64:ff9b::/96` 取出内嵌 IPv4 再按 IPv4 规则判。
+- **IPv6**：`::1`、`::`、`fe80::/10`、`fc00::/7` 全部拒绝。
+- **IPv4 私有/保留段**：`0/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`（CGNAT）、`127/8`。
+- **域名解析**：`dns.promises.lookup(host, { all: true })`，解析出的**每个** IP 都过一遍判定；解析失败或返回空一律**拒绝**（fail-closed）。函数因此改成 `async`，调用点加 `await`。
+- **重绑定域名**：域名里内嵌的禁止段 IPv4（`169.254.169.254.nip.io`、`127.0.0.1.nip.io`）直接拒 —— DNS 层被 catch-all 解析器或 TOCTOU 绕过时，这是唯一还能拦住的判据。内嵌公网 IP（`1.2.3.4.nip.io`）照常放行，避免误伤。
+- **回环**：默认拒绝，但 `allowLoopback`（由 `model.allowCustomHost === true` 传入）可放行。理由：内置 ollama 模板推荐 `http://127.0.0.1:11434/v1`，自建网关（New API 之类）也跑在本机，全禁会打死正当用法；而 `allowCustomHost` **只能由本机回环来源的写请求设置**（`writeRejection`），所以"远端会话改配置把请求打到 127.0.0.1"这条路仍然堵着。
+
+### 验证结果
+
+单元（从真实源码抽函数跑，51 例全过）：
+
+```
+PASS  IPv4-mapped 元数据      http://[::ffff:169.254.169.254]/  want=reject got=reject
+PASS  nip.io 重绑定           http://169.254.169.254.nip.io/    want=reject got=reject
+PASS  回环 127.0.0.1          http://127.0.0.1:3080/api/        want=reject got=reject
+PASS  公网 deepseek           https://api.deepseek.com/...      want=allow  got=allow
+PASS  DNS 解析失败 → 拒绝      https://no-such-host.example/     want=reject got=reject
+51 passed, 0 failed
+```
+
+端到端（`/tmp/e2e-home`，profile `verify`，端口 31904，`openai_compat` 模板 + 恶意 `baseUrl`）：
+
+```
+恶意 + allowCustomHost=false  → {"ok":false,"code":"DEST_NOT_ALLOWED",...}          （凭据白名单先拦）
+恶意 + allowCustomHost=true   → {"ok":false,"error":"测试失败: 禁止访问内网/保留地址"}  （SSRF 拦）
+正常 https://api.deepseek.com → {"ok":false,"error":"测试失败: HTTP 401"}            （真发出去了，未误伤）
+回环 + allowCustomHost=true   → {"ok":false,"error":"测试失败: fetch failed"}         （放行到连接层）
+```
+
+在 `192.168.31.107:31905` 与 `100.119.116.34:31906` 上各挂一个监听器，用同样的恶意 `baseUrl` 打探活，**监听器零连接** —— 请求确实没发出去。
+
+### 残留风险
+
+**DNS rebinding 的 TOCTOU 没有解决。** 这里解析一次、`fetch` 内部再解析一次，两次之间 DNS 可以变。彻底解决要 pin 住 IP 再连（`http.request` 的 `lookup` 选项），而插件用的是 `fetch`，做不到。同理，`6to4`（`2002::/16`）与 Teredo（`2001::/32`）里内嵌的 IPv4 也没有还原判定。
+
 ## 已知限制
 
 - 只在 **DSH 0.2.3-alpha.2** 上端到端验证过。0.2.2-rc.2 到 0.2.3-alpha.2 之间的版本没有逐个验证。
-- 补丁按上游 0.4.2 的代码逐字节匹配 46 个锚点。上游一旦改动其中任何一处，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
-- 半打补丁（24 处只命中一部分）会被显式拒绝，并逐处报告哪一处没打上，不会静默写坏文件。
+- 补丁按上游 0.4.2 的代码逐字节匹配 52 个锚点。上游一旦改动其中任何一处，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
+- 半打补丁（52 处只命中一部分）会被显式拒绝，并逐处报告哪一处没打上，不会静默写坏文件。
 - 只处理 `lib/index.js` 与 `assets/whale-widget.js` 两个文件。如果上游把栅栏逻辑或前端命中测试挪到别的文件，补丁不适用。
 - 写请求（POST/PUT/PATCH/DELETE）仍然只允许回环来源，这是上游 0.3.15 起的既有策略（`writeRejection`），本补丁没有放宽。远端管理仍需 `DSHW_ADMIN_HOSTS`。
+- 第十四处的 SSRF 防护**没有解决 DNS rebinding 的 TOCTOU**：校验时解析一次、`fetch` 时再解析一次，两次之间 DNS 可以变。要彻底解决得 pin 住 IP 再连，而插件用的是 `fetch`。
+- 第十四处的域名判定依赖本机 DNS。解析失败一律拒绝（fail-closed），所以 DNS 临时故障时余额/额度请求会失败并报「无法解析接口地址的域名」。
 
 ## 参考
 

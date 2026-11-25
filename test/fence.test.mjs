@@ -12,6 +12,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import dns from 'node:dns'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
@@ -1099,4 +1100,113 @@ test('pruneLedgerUsage：源码里确实处理了 accounting.books（防止锚�
   assert.ok(fn.includes('bookDaysDropped'), 'pruneLedgerUsage 必须统计被删的日行')
   assert.ok(/scope !== a\.active/.test(fn), '必须显式保护 active 本')
   assert.ok(fn.includes('ar.accounting'), '必须把日行归档进 ar.accounting')
+})
+
+// —— 第十四组：SSRF 防护（assertSafeApiUrl）——
+// 抽真实源码跑：从 `function ipv4Parts` 到「凭据目的地白名单」注释之间。
+// dns 可注入桩，用来测 fail-closed 与「域名解析到内网」——真实 DNS 在 CI 里不可控。
+
+const ssrfA = src.indexOf('    function ipv4Parts(s) {')
+const ssrfB = src.indexOf('    // —— v761（安全修复 S1）：**凭据目的地白名单** ——')
+if (ssrfA < 0 || ssrfB < 0) {
+  console.error('找不到 SSRF 代码段的边界（ipv4Parts / 凭据目的地白名单）。补丁可能未应用。')
+  process.exit(1)
+}
+const ssrfBody = src.slice(ssrfA, ssrfB)
+const buildSsrf = (dnsImpl) => new Function('URL', 'dns', ssrfBody + '\nreturn assertSafeApiUrl')(URL, dnsImpl)
+const ssrfReal = buildSsrf(dns)
+const ssrfStub = (impl) => buildSsrf({ promises: { lookup: impl } })
+
+async function ssrfVerdict(fn, url, opts) {
+  try { await fn(url, opts); return 'allow' } catch (err) { return 'reject' }
+}
+
+test('SSRF：报告里的 10 个绕过用例全部拒绝', async () => {
+  const cases = [
+    'http://169.254.169.254/latest/meta-data/',
+    'http://[::ffff:169.254.169.254]/',
+    'http://[::ffff:a9fe:a9fe]/',
+    'http://169.254.169.254.nip.io/',
+    'http://127.0.0.1:3080/api/',
+    'http://[::1]/',
+    'http://0.0.0.0/',
+    'http://[fd00::1]/',
+    'http://10.0.0.1/',
+    'http://192.168.1.1/',
+  ]
+  for (const u of cases) assert.equal(await ssrfVerdict(ssrfReal, u), 'reject', `${u} 应被拒绝`)
+})
+
+test('SSRF：正常公网地址仍放行', async () => {
+  assert.equal(await ssrfVerdict(ssrfReal, 'https://api.deepseek.com/user/balance'), 'allow')
+  assert.equal(await ssrfVerdict(ssrfReal, 'https://api.openai.com/v1/models'), 'allow')
+})
+
+test('SSRF：IPv4 私有/保留段边界', async () => {
+  const reject = ['http://10.0.0.1/', 'http://172.16.0.1/', 'http://172.31.255.255/',
+    'http://192.168.1.1/', 'http://169.254.1.1/', 'http://100.64.0.1/',
+    'http://100.127.255.255/', 'http://127.255.255.254/', 'http://0.0.0.0/']
+  for (const u of reject) assert.equal(await ssrfVerdict(ssrfReal, u), 'reject', `${u} 应被拒绝`)
+  const allow = ['http://172.32.0.1/', 'http://100.128.0.1/', 'http://8.8.8.8/']
+  for (const u of allow) assert.equal(await ssrfVerdict(ssrfReal, u), 'allow', `${u} 应放行`)
+})
+
+test('SSRF：IPv6 回环 / ULA / link-local / IPv4-mapped / NAT64', async () => {
+  const reject = ['http://[::1]/', 'http://[::]/', 'http://[fd00::1]/', 'http://[fc00::1]/',
+    'http://[fdff::1]/', 'http://[fe80::1]/', 'http://[febf::1]/',
+    'http://[::ffff:169.254.169.254]/', 'http://[::ffff:a9fe:a9fe]/',
+    'http://[::ffff:10.0.0.1]/', 'http://[64:ff9b::a9fe:a9fe]/']
+  for (const u of reject) assert.equal(await ssrfVerdict(ssrfReal, u), 'reject', `${u} 应被拒绝`)
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://[2606:4700:4700::1111]/'), 'allow', '公网 IPv6 应放行')
+})
+
+test('SSRF：回环默认拒绝，allowLoopback 才放行（自建网关用法）', async () => {
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://127.0.0.1:3080/api/'), 'reject')
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://127.0.0.1:3080/api/', { allowLoopback: true }), 'allow')
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://[::1]/', { allowLoopback: true }), 'allow')
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://localhost:8080/v1', { allowLoopback: true }), 'allow')
+  // 放行回环不能顺带放行内网 / 元数据 / ULA
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://10.0.0.1/', { allowLoopback: true }), 'reject')
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://169.254.169.254/', { allowLoopback: true }), 'reject')
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://[fd00::1]/', { allowLoopback: true }), 'reject')
+})
+
+test('SSRF：重绑定域名（内嵌禁止段 IPv4）', async () => {
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://169.254.169.254.nip.io/'), 'reject')
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://127.0.0.1.nip.io/'), 'reject')
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://10.0.0.1.sslip.io/'), 'reject')
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://1.2.3.4.nip.io/'), 'allow', '内嵌公网 IP 不该误伤')
+})
+
+test('SSRF：畸形 URL / 非 http(s) / userinfo 一律拒绝', async () => {
+  assert.equal(await ssrfVerdict(ssrfReal, 'http://[fe80::1%25eth0]/'), 'reject')
+  assert.equal(await ssrfVerdict(ssrfReal, 'file:///etc/passwd'), 'reject')
+  assert.equal(await ssrfVerdict(ssrfReal, 'ftp://example.com/'), 'reject')
+  assert.equal(await ssrfVerdict(ssrfReal, 'https://user:pass@api.deepseek.com/v1'), 'reject')
+})
+
+test('SSRF：DNS 解析失败 → 拒绝（fail-closed）', async () => {
+  const fail = ssrfStub(async () => { throw Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' }) })
+  assert.equal(await ssrfVerdict(fail, 'https://no-such-host.example/'), 'reject')
+  const empty = ssrfStub(async () => [])
+  assert.equal(await ssrfVerdict(empty, 'https://empty.example/'), 'reject')
+})
+
+test('SSRF：域名解析到内网 / 元数据 / 回环 → 拒绝', async () => {
+  const mk = (addr) => ssrfStub(async () => [{ address: addr, family: addr.includes(':') ? 6 : 4 }])
+  assert.equal(await ssrfVerdict(mk('10.0.0.5'), 'https://evil.example/'), 'reject')
+  assert.equal(await ssrfVerdict(mk('169.254.169.254'), 'https://evil.example/'), 'reject')
+  assert.equal(await ssrfVerdict(mk('::1'), 'https://evil.example/'), 'reject')
+  assert.equal(await ssrfVerdict(mk('::ffff:169.254.169.254'), 'https://evil.example/'), 'reject')
+  assert.equal(await ssrfVerdict(mk('93.184.216.34'), 'https://public.example/'), 'allow')
+  // 混合解析：只要有一个内网 IP 就拒
+  const mixed = ssrfStub(async () => [{ address: '8.8.8.8', family: 4 }, { address: '192.168.1.1', family: 4 }])
+  assert.equal(await ssrfVerdict(mixed, 'https://mixed.example/'), 'reject')
+})
+
+test('SSRF：调用点确实传了 allowLoopback（防止锚点被回退）', () => {
+  const n = (src.match(/allowLoopback: model\.allowCustomHost === true/g) || []).length
+  assert.equal(n, 4, `4 个 apiFetchJson 调用点都要传 allowLoopback，实际 ${n} 处`)
+  assert.ok(src.includes('await assertSafeApiUrl(u, o)'), 'apiFetchJson 里必须 await 并透传 opts')
+  assert.ok(!/^\s+assertSafeApiUrl\(u\)$/m.test(src), '不该残留同步调用')
 })
