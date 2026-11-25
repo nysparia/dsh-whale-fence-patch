@@ -1210,3 +1210,221 @@ test('SSRF：调用点确实传了 allowLoopback（防止锚点被回退）', ()
   assert.ok(src.includes('await assertSafeApiUrl(u, o)'), 'apiFetchJson 里必须 await 并透传 opts')
   assert.ok(!/^\s+assertSafeApiUrl\(u\)$/m.test(src), '不该残留同步调用')
 })
+
+// —— 第十五组：删片段留下悬空引用 ——
+// 抽**真实的** delete-fragment 分支跑：从 `if (action === 'delete-fragment')` 起花括号配平。
+// 依赖全部注入（res / index / writeAudioIndex / audioFragmentPath / fs / 两个 payload），
+// 所以跑的就是仓库里那份代码，不是复制品。
+
+const delFragAt = src.indexOf("if (action === 'delete-fragment')")
+if (delFragAt < 0) {
+  console.error('找不到 delete-fragment 分支。补丁可能未应用。')
+  process.exit(1)
+}
+const DEL_FRAG_BLOCK = blockAt(src, delFragAt)
+if (!DEL_FRAG_BLOCK.includes('affectedGroups')) {
+  console.error('delete-fragment 分支里没有 affectedGroups —— 第十五组补丁未应用。')
+  process.exit(1)
+}
+
+function runDeleteFrag(index, id, presets = {}) {
+  const unlinked = []
+  let persisted = null
+  const res = {
+    statusCode: 0,
+    body: null,
+    writeHead(code) { this.statusCode = code },
+    end(b) { this.body = JSON.parse(b) },
+  }
+  const fn = new Function(
+    'action', 'parsed', 'res', 'JSON_HEADERS', 'PRESET_FRAGMENTS', 'index',
+    'writeAudioIndex', 'audioFragmentPath', 'fs', 'audioFragmentsPayload', 'audioGroupsPayload',
+    DEL_FRAG_BLOCK,
+  )
+  fn(
+    'delete-fragment', { id }, res, { 'Content-Type': 'application/json' }, presets, index,
+    (idx) => { persisted = JSON.parse(JSON.stringify(idx)) }, // 模拟落盘
+    (fid) => '/tmp/fake-audio/' + fid + '.wav',
+    { unlinkSync(p) { unlinked.push(p) } },
+    () => (index.fragments || []).map((f) => ({ id: f.id, name: f.name, preset: false })),
+    () => (Array.isArray(index.groups) ? index.groups : []).filter(Boolean).map((g) => ({
+      id: g.id, name: g.name,
+      press: typeof g.press === 'string' ? g.press : null,
+      release: typeof g.release === 'string' ? g.release : null,
+    })),
+  )
+  return { status: res.statusCode, body: res.body, persisted, unlinked }
+}
+
+const mkAudioIndex = (groups, fragments) => ({
+  groups: groups.map((g) => (g ? { ...g } : g)),
+  fragments: fragments.map((f) => ({ ...f })),
+})
+
+test('删片段：组 press 指向它 → press 变空串（静音），release 不动', () => {
+  const idx = mkAudioIndex(
+    [{ id: 'gA', name: '组A', press: 'X', release: 'Y' }],
+    [{ id: 'X', name: '片段X' }, { id: 'Y', name: '片段Y' }],
+  )
+  const r = runDeleteFrag(idx, 'X')
+  assert.equal(r.status, 200)
+  assert.equal(r.persisted.groups[0].press, '')
+  assert.equal(r.persisted.groups[0].release, 'Y')
+  assert.deepEqual(r.body.affectedGroups, [{ id: 'gA', name: '组A', slot: 'press' }])
+})
+
+test('删片段：press 与 release 都指向它 → 两个都变空串', () => {
+  const idx = mkAudioIndex(
+    [{ id: 'gB', name: '组B', press: 'X', release: 'X' }],
+    [{ id: 'X', name: '片段X' }],
+  )
+  const r = runDeleteFrag(idx, 'X')
+  assert.equal(r.persisted.groups[0].press, '')
+  assert.equal(r.persisted.groups[0].release, '')
+  assert.deepEqual(r.body.affectedGroups, [
+    { id: 'gB', name: '组B', slot: 'press' },
+    { id: 'gB', name: '组B', slot: 'release' },
+  ])
+})
+
+test('删片段：多个组引用它 → 全部改，affectedGroups 全列出', () => {
+  const idx = mkAudioIndex(
+    [
+      { id: 'g1', name: '一', press: 'X', release: 'Y' },
+      { id: 'g2', name: '二', press: 'Z', release: 'X' },
+      { id: 'g3', name: '三', press: 'X', release: 'X' },
+    ],
+    [{ id: 'X', name: '片段X' }, { id: 'Y', name: '片段Y' }, { id: 'Z', name: '片段Z' }],
+  )
+  const r = runDeleteFrag(idx, 'X')
+  assert.equal(r.persisted.groups[0].press, '')
+  assert.equal(r.persisted.groups[0].release, 'Y')
+  assert.equal(r.persisted.groups[1].press, 'Z')
+  assert.equal(r.persisted.groups[1].release, '')
+  assert.equal(r.persisted.groups[2].press, '')
+  assert.equal(r.persisted.groups[2].release, '')
+  assert.deepEqual(r.body.affectedGroups, [
+    { id: 'g1', name: '一', slot: 'press' },
+    { id: 'g2', name: '二', slot: 'release' },
+    { id: 'g3', name: '三', slot: 'press' },
+    { id: 'g3', name: '三', slot: 'release' },
+  ])
+})
+
+test('删片段：响应里的 groups 已反映置空（前端直接拿它重渲染）', () => {
+  const idx = mkAudioIndex(
+    [{ id: 'gA', name: '组A', press: 'X', release: 'X' }],
+    [{ id: 'X', name: '片段X' }],
+  )
+  const r = runDeleteFrag(idx, 'X')
+  assert.equal(r.body.groups[0].press, '')
+  assert.equal(r.body.groups[0].release, '')
+})
+
+test('删片段：没人引用 → affectedGroups 为空，其他组不变，片段本身删掉', () => {
+  const idx = mkAudioIndex(
+    [{ id: 'gA', name: '组A', press: 'Y', release: 'Z' }],
+    [{ id: 'X', name: '片段X' }, { id: 'Y', name: '片段Y' }, { id: 'Z', name: '片段Z' }],
+  )
+  const r = runDeleteFrag(idx, 'X')
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.body.affectedGroups, [])
+  assert.equal(r.persisted.groups[0].press, 'Y')
+  assert.equal(r.persisted.groups[0].release, 'Z')
+  assert.equal(r.persisted.fragments.length, 2)
+})
+
+test('删片段：预设片段 → 400，片段/组/磁盘文件都不动', () => {
+  const idx = mkAudioIndex(
+    [{ id: 'gA', name: '组A', press: 'ya1', release: 'ya2' }],
+    [{ id: 'X', name: '片段X' }],
+  )
+  const r = runDeleteFrag(idx, 'ya1', { ya1: { name: '鸭叫·按下' } })
+  assert.equal(r.status, 400)
+  assert.equal(r.body.ok, false)
+  assert.equal(r.body.error, 'cannot delete preset fragment')
+  assert.equal(r.persisted, null, '预设片段不该落盘')
+  assert.deepEqual(r.unlinked, [], '预设片段不该 unlink')
+  assert.equal(idx.fragments.length, 1)
+  assert.equal(idx.groups[0].press, 'ya1')
+})
+
+test('删片段：groups 非数组 / 组为 null / 组缺 id 都不报错', () => {
+  const r0 = runDeleteFrag({ groups: null, fragments: [{ id: 'X', name: '片段X' }] }, 'X')
+  assert.equal(r0.status, 200)
+  assert.deepEqual(r0.body.affectedGroups, [])
+
+  const idx = mkAudioIndex([null, { press: 'X' }, { id: 'g', name: 'g', press: 'X' }], [{ id: 'X', name: '片段X' }])
+  const r = runDeleteFrag(idx, 'X')
+  assert.equal(r.status, 200)
+  assert.equal(r.persisted.groups[2].press, '')
+  assert.deepEqual(r.body.affectedGroups, [
+    { id: '', name: '', slot: 'press' },
+    { id: 'g', name: 'g', slot: 'press' },
+  ])
+})
+
+test('删片段：槽位为 null / 缺失 / 指向别的片段 → 不算受影响', () => {
+  const idx = mkAudioIndex(
+    [
+      { id: 'g1', name: '一', press: null, release: undefined },
+      { id: 'g2', name: '二', press: 'Y', release: 'Y' },
+    ],
+    [{ id: 'X', name: '片段X' }, { id: 'Y', name: '片段Y' }],
+  )
+  const r = runDeleteFrag(idx, 'X')
+  assert.deepEqual(r.body.affectedGroups, [])
+  assert.equal(r.persisted.groups[0].press, null, 'null 不该被改成空串')
+  assert.equal(r.persisted.groups[1].press, 'Y')
+})
+
+test('删片段：自定义片段确实 unlink 对应 wav', () => {
+  const r = runDeleteFrag(mkAudioIndex([], [{ id: 'X', name: '片段X' }]), 'X')
+  assert.deepEqual(r.unlinked, ['/tmp/fake-audio/X.wav'])
+})
+
+test('删片段：源码里不再有「静默回退 duck」的注释与行为（防止锚点被回退）', () => {
+  assert.ok(DEL_FRAG_BLOCK.includes("g[slot] = ''"), '必须把槽位置空')
+  assert.ok(DEL_FRAG_BLOCK.includes('affectedGroups.push('), '必须收集受影响的组')
+  assert.ok(!DEL_FRAG_BLOCK.includes('PRESET_GROUPS.duck'), '不能把悬空引用改成 duck')
+})
+
+// —— 前端侧：toast 与草稿置空 ——
+
+const frontFile = path.join(pluginDir, 'assets', 'whale-widget.js')
+if (!fs.existsSync(frontFile)) {
+  console.error(`找不到 ${frontFile}。用 --path <dir> 或 WHALE_PLUGIN_DIR 指定插件目录。`)
+  process.exit(1)
+}
+const frontSrc = fs.readFileSync(frontFile, 'utf8')
+
+test('前端：audioFragDeleteNotice 存在，且两个 delete-fragment 调用点都调它', () => {
+  assert.ok(frontSrc.includes('function audioFragDeleteNotice('), '缺少 audioFragDeleteNotice')
+  const calls = (frontSrc.match(/audioFragDeleteNotice\(/g) || []).length
+  assert.equal(calls, 3, `1 处定义 + 2 处调用，实际 ${calls} 处`)
+  assert.ok(frontSrc.includes('audioFragDeleteNotice(fragName, d.affectedGroups)'), '资源窗口调用点没接 affectedGroups')
+  assert.ok(frontSrc.includes('audioFragDeleteNotice(f.name, d.affectedGroups)'), '槽位面板调用点没接 affectedGroups')
+})
+
+test('前端：toast 里的组名做了 HTML 转义（组名是用户输入）', () => {
+  const fn = extractFnSafe(frontSrc, 'audioFragDeleteNotice')
+  assert.ok(fn.includes("replace(/&/g, '&amp;')"), '必须转义 &')
+  assert.ok(fn.includes("replace(/</g, '&lt;')"), '必须转义 <')
+  assert.ok(fn.includes("replace(/>/g, '&gt;')"), '必须转义 >')
+})
+
+test('前端：槽位面板删片段不再回退 ya1/ya2（那是静默替换成预设鸭叫）', () => {
+  assert.ok(!frontSrc.includes("audioEditPressVal = 'ya1'; audioSlotBtnText(audioEditPressBtn, 'ya1')"),
+    'press 草稿不该回退 ya1')
+  assert.ok(!frontSrc.includes("audioEditReleaseVal = 'ya2'; audioSlotBtnText(audioEditReleaseBtn, 'ya2')"),
+    'release 草稿不该回退 ya2')
+  assert.ok(frontSrc.includes("audioEditPressVal = ''; audioSlotBtnText(audioEditPressBtn, '')"),
+    'press 草稿应置空')
+  assert.ok(frontSrc.includes("audioEditReleaseVal = ''; audioSlotBtnText(audioEditReleaseBtn, '')"),
+    'release 草稿应置空')
+})
+
+test('前端：删除确认文案不再承诺「自动回退预设」', () => {
+  assert.ok(!frontSrc.includes('引用该片段的音效组槽位会自动回退预设'), '旧文案会误导用户')
+  assert.ok(frontSrc.includes('引用该片段的音效组槽位会改为留空（不发声）'), '新文案应说明改为留空')
+})

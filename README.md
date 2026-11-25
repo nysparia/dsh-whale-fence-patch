@@ -2,7 +2,7 @@
 
 > **社区补丁，非上游官方。** 上游 `dsh-whale-widget` 自 0.4.2（2026-10-11）起没有新版本，本仓库是第三方临时方案。上游修复后请卸载。
 
-给已安装的 [`dsh-whale-widget`](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) 打上游 bug 的补丁，共十四组，落在**两个文件**上：`lib/index.js`（宿主侧，①~⑩、⑬ 与 ⑭）与 `assets/whale-widget.js`（前端侧，⑪ ⑫）。
+给已安装的 [`dsh-whale-widget`](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) 打上游 bug 的补丁，共十五组，落在**两个文件**上：`lib/index.js`（宿主侧，①~⑩、⑬ ⑭ 与 ⑮）与 `assets/whale-widget.js`（前端侧，⑪ ⑫ 与 ⑮）。
 
 | # | 修的问题 | 锚点数 | 净增行 |
 |---|---|---|---|
@@ -18,8 +18,9 @@
 | ⑫ | **每秒轮询无 in-flight 守卫、页面隐藏时不暂停**（issue #342）—— 响应慢于 1 秒时请求堆叠；后台仍 2 req/s | 3 | +0 |
 | ⑬ | **账本 `accounting.books[*].days` 无限增长** —— `pruneLedgerUsage()` 只清 `events`/`history`，日行永不回收；换一次 API key 多一本，多本 × 多年成倍放大 | 1 | +68 |
 | ⑭ | **SSRF 防护绕过** —— `assertSafeApiUrl()` 注释承诺"禁止访问云元数据"，实际只挡点分十进制 IPv4 的 `169.254/16` 与 `0/8`；IPv4-mapped IPv6、`::1`、ULA、私有段、重绑定域名全部放行 | 6 | +142 |
+| ⑮ | **删片段留下悬空引用** —— `delete-fragment` 只删 `index.fragments` 与磁盘文件，不碰 `index.groups`；组的 `press`/`release` 存的就是片段 id，于是界面显示原始 id、播放时**静默回退 duck 预设**（用户的自定义音效悄悄变成小黄鸭） | 3 | +40 |
 
-共 **52 个锚点**（`lib/index.js` 37 个 + `assets/whale-widget.js` 15 个）。① ② ③ 是同一组（栅栏），④ 与栅栏无关，⑤~⑩、⑬ 与 ⑭ 是另外八个独立 bug，⑪ ⑫ 是前端侧的两个性能 bug。
+共 **55 个锚点**（`lib/index.js` 38 个 + `assets/whale-widget.js` 17 个）。① ② ③ 是同一组（栅栏），④ 与栅栏无关，⑤~⑩、⑬ ⑭ 与 ⑮ 是另外九个独立 bug，⑪ ⑫ 是前端侧的两个性能 bug，⑮ 同时改宿主与前端。
 
 **本仓库不包含上游的任何代码或素材**，只有一个改写脚本（`patch.mjs`）和它的测试。脚本就地修改你机器上已经装好的那份上游副本，素材仍然用上游的。
 
@@ -537,7 +538,7 @@ node patch.mjs --profile web
 
 1. 定位 `~/.dsh/profiles/web/node_modules/dsh-whale-widget`；
 2. 读 `package.json` 打印版本号；
-3. 逐字节匹配上游 0.4.2 的 **52 个锚点**（两个文件各一组），任何一个找不到就**失败退出**（不猜位置）；
+3. 逐字节匹配上游 0.4.2 的 **55 个锚点**（两个文件各一组），任何一个找不到就**失败退出**（不猜位置）；
 4. 备份原文件到 `lib/index.js.bak` / `assets/whale-widget.js.bak`（已存在则不覆盖）；
 5. 写入补丁，跑 `node --check` 验证语法，不通过则回滚。
 
@@ -616,14 +617,14 @@ node test/fence.test.mjs --path ~/.dsh/profiles/web/node_modules/dsh-whale-widge
 - 归档写盘失败（EACCES）→ 返回 `false` 且 `books.days` / `history` / `events` 一行都不删；
 - 静态断言：`pruneLedgerUsage` 里确实有 `led.accounting` / `bookDaysDropped` / `scope !== a.active` / `ar.accounting`（防止锚点被回退）。
 
-全部通过时退出 0。共 **49 个测试**。
+全部通过时退出 0。共 **73 个测试**。
 
 ## 许可与素材声明
 
 - **本仓库不包含上游的任何代码或素材。** 仓库里只有 `patch.mjs`、`test/fence.test.mjs`、文档和许可文件。补丁以字符串常量的形式描述"把哪两段改成什么"，不复制上游文件。
 - 上游 `dsh-whale-widget` 的**代码**（`lib/`、`cordis.patch.yml`、`package.json`、文档）是 MIT。
 - 上游的 **`assets/**`（约 6.6MB 图片 / 动图 / 音效）和 `icon.png` 不在 MIT 覆盖范围内**。上游 `PROVENANCE.md` 写明它们"仅授权随本插件运行使用，不授予再许可"。因此本仓库不重新分发它们 —— 补丁只改用户已安装副本里的 `lib/index.js` 与 `assets/whale-widget.js`（后者是脚本，不是素材），素材仍由那份副本提供。
-- 本补丁改 `lib/index.js`（31 个锚点）与 `assets/whale-widget.js`（15 个锚点）。`lib/index.js` 的 31 个锚点：栅栏三处（净增 24 行）、音效查表一处（净增 13 行）、body 超限十处（净增 21 行）、方法守卫三处（净增 18 行）、节假日两处（净增 32 行）、损坏备份五处（净增 41 行）、waitState 分桶四处（净增 64 行）、账本 IO 退避一处（净增 14 行）、update-check 去重一处（净增 28 行）、账本 books 保留策略一处（净增 68 行）。
+- 本补丁改 `lib/index.js`（38 个锚点）与 `assets/whale-widget.js`（17 个锚点）。`lib/index.js` 的 38 个锚点：栅栏三处（净增 24 行）、音效查表一处（净增 13 行）、body 超限十处（净增 21 行）、方法守卫三处（净增 18 行）、节假日两处（净增 32 行）、损坏备份五处（净增 41 行）、waitState 分桶四处（净增 64 行）、账本 IO 退避一处（净增 14 行）、update-check 去重一处（净增 28 行）、账本 books 保留策略一处（净增 68 行）、SSRF 防护六处（净增 142 行）、删片段清理组引用一处（净增 15 行）。`assets/whale-widget.js` 的 17 个锚点：pointermove 十二处（净增 116 行）、轮询三处（净增 0 行）、删片段 toast 与草稿置空两处（净增 25 行）。
 
 ## 上游状态
 
@@ -760,11 +761,103 @@ PASS  DNS 解析失败 → 拒绝      https://no-such-host.example/     want=re
 
 **DNS rebinding 的 TOCTOU 没有解决。** 这里解析一次、`fetch` 内部再解析一次，两次之间 DNS 可以变。彻底解决要 pin 住 IP 再连（`http.request` 的 `lookup` 选项），而插件用的是 `fetch`，做不到。同理，`6to4`（`2002::/16`）与 Teredo（`2001::/32`）里内嵌的 IPv4 也没有还原判定。
 
+## 第十五处：删片段留下悬空引用
+
+### 症状
+
+删掉一个自定义音效片段后，之前用它的音效组：
+
+1. 界面上显示一串原始 id（`audio_mwvm922o_248w1e`），不是名字；
+2. 点按响的是**小黄鸭**，不是原来的声音，也不是静音 —— 界面上没有任何提示。
+
+### 根因
+
+`lib/index.js` 的 `delete-fragment` 分支只删 `index.fragments` 里的条目和磁盘文件，**完全不碰 `index.groups`**：
+
+```js
+index.fragments = index.fragments.filter((f) => f.id !== id)
+writeAudioIndex(index)
+const p = audioFragmentPath(id)
+if (p) { try { fs.unlinkSync(p) } catch (err) {} }
+res.writeHead(200, JSON_HEADERS)
+res.end(JSON.stringify({ ok: true, fragments: audioFragmentsPayload(), groups: audioGroupsPayload() }))
+```
+
+而音效组的 `press` / `release` 字段存的就是片段 id。后果链：
+
+1. `audioGroupsPayload()` 把 `press` / `release` 原样返回，不检查片段是否还存在；
+2. 前端 `audioSlotName(id)` 找不到片段时 `return id` —— 用户看到原始 id；
+3. 播放时 `groupFragmentId()` 对失效引用**静默回退 duck 预设**：
+
+```js
+if (fid) {
+  if (PRESET_FRAGMENTS[fid]) return fid
+  if (customFragExists(fid)) return fid
+}
+// 无字段/引用失效 → 回退预设：新组无引用时用 duck
+return slot === 'press' ? PRESET_GROUPS.duck.press : PRESET_GROUPS.duck.release
+```
+
+### 修法
+
+**删片段时把引用它的槽位置空（`''` = 该事件静音），并在响应里带 `affectedGroups`。**
+
+选「改成静音」而不是「改成 duck」：静音是显式的、用户能在界面上看见（前端已有 `''` 的语义 —— `audioSlotBtnText` 显示「留空·不发声」，`groupFragmentId` 返回 `''` 表示静音）；duck 是静默替换，用户以为还是自己的音效。这与插件里 `writeRejection` 那条"配置改动必须可见"的原则一致。
+
+- **宿主**：遍历 `index.groups`，把 `press` / `release` 等于被删 id 的改成 `''`，收集 `affectedGroups: [{ id, name, slot }]`；`groups` 不是数组 / 组为 `null` 时跳过不报错。
+- **前端**：`audioFragDeleteNotice()` 把「N 个音效组槽位已改为留空」讲给用户听（组名是用户输入，进 toast 前转义）；槽位面板里删片段时，编辑草稿也置空而不是回退 `ya1`/`ya2`（那同样是静默替换成预设鸭叫）；删除确认文案从「会自动回退预设」改成「会改为留空（不发声）」。
+
+### 验证结果
+
+单元（从真实源码抽 `delete-fragment` 分支跑，10 例全过）：
+
+```
+✓ 组 A：press 指向 X，删 X → press 变空串
+✓ 组 B：press 与 release 都指向 X → 两个都变空串
+✓ 组 C：press→X、release→Y，删 X → press 空、release 仍是 Y
+✓ 多个组引用 X → 全部改，affectedGroups 全列出
+✓ 响应 groups 里 press/release 已是空串
+✓ 删无人引用的片段 → affectedGroups 为空，其他组不变
+✓ 删预设片段 → 400，片段/组/磁盘文件都不动
+✓ 边界：groups 非数组、组为 null、组缺 id 都不报错
+✓ 边界：槽位为 null / 缺失 / 指向别的片段 → 不算受影响
+✓ 删自定义片段 → unlink 对应 wav
+```
+
+端到端（`/tmp/e2e-home`，profile `verify`，端口 31907）：
+
+```
+1. upload-fragment 成功            id=audio_mwvqp2wf_jtd1s0 wav=844B
+2. save-group 成功                 gid=group_mwvqp2wh_1b6lp2
+2b. 建组后 press/release == 片段 id
+3. delete-fragment 返回 200 + ok
+3b. affectedGroups 列出该组两个槽位  [{"id":"group_mwvqp2wh_1b6lp2","name":"测试组","slot":"press"},
+                                    {"id":"group_mwvqp2wh_1b6lp2","name":"测试组","slot":"release"}]
+4b. press 变成 ''                   ''
+4c. release 变成 ''                 ''
+5. press.mp3?set=<组> 返回 204（静音）  status=204 bytes=0
+5b. release.mp3?set=<组> 返回 204      status=204 bytes=0
+5c. 对照：set=duck 仍返回 200 且有音频字节  status=200 bytes=6370
+6. 删预设片段 ya1 → 400             error=cannot delete preset fragment
+7. 删无人引用的片段 → affectedGroups == []
+```
+
+修复前后对照（同一个服务，手工往 `audio.json` 里塞一个悬空引用）：
+
+```
+悬空引用（修复前的数据形态）  press.mp3?set=group_dangling  → 200 (6370 bytes)  ← 小黄鸭
+槽位置空（修复后的数据形态）  press.mp3?set=group_mwvqp2wh → 204 (0 bytes)      ← 静音
+```
+
+### 没修的部分
+
+**已经存在的悬空引用不会自动修复。** 本次只保证"以后删片段不再产生悬空引用"。修复前就已经悬空的组，槽位里仍是那个失效 id，播放仍会回退 duck。没有在 `audioGroupsPayload()` 里做读时归一化，是因为那会造成新的不一致：界面显示「留空」但 `groupFragmentId()` 读的是 `readAudioIndex()`，播放仍响 duck —— 比现在更糟。要修得在读取时同时写回，属于另一处改动。
+
 ## 已知限制
 
 - 只在 **DSH 0.2.3-alpha.2** 上端到端验证过。0.2.2-rc.2 到 0.2.3-alpha.2 之间的版本没有逐个验证。
-- 补丁按上游 0.4.2 的代码逐字节匹配 52 个锚点。上游一旦改动其中任何一处，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
-- 半打补丁（52 处只命中一部分）会被显式拒绝，并逐处报告哪一处没打上，不会静默写坏文件。
+- 补丁按上游 0.4.2 的代码逐字节匹配 55 个锚点。上游一旦改动其中任何一处，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
+- 半打补丁（55 处只命中一部分）会被显式拒绝，并逐处报告哪一处没打上，不会静默写坏文件。
 - 只处理 `lib/index.js` 与 `assets/whale-widget.js` 两个文件。如果上游把栅栏逻辑或前端命中测试挪到别的文件，补丁不适用。
 - 写请求（POST/PUT/PATCH/DELETE）仍然只允许回环来源，这是上游 0.3.15 起的既有策略（`writeRejection`），本补丁没有放宽。远端管理仍需 `DSHW_ADMIN_HOSTS`。
 - 第十四处的 SSRF 防护**没有解决 DNS rebinding 的 TOCTOU**：校验时解析一次、`fetch` 时再解析一次，两次之间 DNS 可以变。要彻底解决得 pin 住 IP 再连，而插件用的是 `fetch`。

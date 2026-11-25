@@ -3,7 +3,7 @@
 //
 // 改**两个**文件：
 //
-// 【lib/index.js】十二组（共 37 个锚点）：
+// 【lib/index.js】十三组（共 38 个锚点）：
 //   ① connectionFence()           —— 栅栏兼容（DSH >= 0.2.2-rc.2 的 admit）
 //   ② rejected() 的栅栏分派        —— 同上
 //   ③ root.inject 列表             —— 补 connection.authentication，否则 admit 恒抛
@@ -17,12 +17,15 @@
 //   ⑬ 账本 accounting.books[*].days 无限增长 —— 与 history 同口径保留 365 天并归档；空本整本删（active 除外）
 //   ⑭ assertSafeApiUrl() 的 SSRF 绕过 —— IPv4-mapped/NAT64 还原、IPv6 回环/ULA/link-local、
 //      私有段、域名 DNS 解析（fail-closed）、重绑定域名；回环默认拒、allowCustomHost 才放行
+//   ⑮ 删片段留下悬空引用 —— delete-fragment 把引用它的组槽位置空（'' = 静音）并回 affectedGroups，
+//      不再让 groupFragmentId() 静默回退 duck（用户的自定义音效悄悄变成小黄鸭）
 //
-// 【assets/whale-widget.js】两组（共 15 个锚点）：
+// 【assets/whale-widget.js】三组（共 17 个锚点）：
 //   ⑪ issue #339：onDocPointerMoveCursor 每次 pointermove 都强制同步布局
 //      —— rAF 节流 + 用 e.target 代替 elementFromPoint + 矩形/命中图 alpha 表缓存
 //   ⑫ issue #342：每秒轮询无 in-flight 守卫、页面隐藏时不暂停
 //      —— 两个 poll 各加 busy 守卫 + document.hidden 跳过 + visibilitychange 回前台补一次
+//   ⑮ 删片段后 toast 告知哪些组被置空 + 槽位面板草稿置空（不回退 ya1/ya2）
 //
 // 不复制、不分发上游任何代码或素材；素材仍由用户已安装的上游副本提供。
 //
@@ -1553,6 +1556,49 @@ const ORIGINAL_SSRF_USAGE = `          const d2 = await apiFetchJson(usageUrl, u
 const PATCHED_SSRF_USAGE = `          const d2 = await apiFetchJson(usageUrl, u.auth || b.auth, key, { allowLoopback: model.allowCustomHost === true })
 `
 
+// —— 第十五组：删片段留下悬空引用 ——
+// 上游 delete-fragment 只删 index.fragments 与磁盘文件，完全不碰 index.groups；
+// 而组的 press/release 存的就是片段 id。于是：
+//   ① audioGroupsPayload() 原样返回悬空 id → 前端 audioSlotName() 找不到就 return id，
+//      用户看到 audio_mwvm922o_248w1e 这种原始 id；
+//   ② 播放时 groupFragmentId() 对失效引用**静默回退 duck 预设** → 用户的自定义音效
+//      悄悄变成小黄鸭，界面上没有任何提示。
+// 修法：删片段时把引用它的槽位置空（'' = 该事件静音，前端已有「留空·不发声」语义），
+// 并在响应里带 affectedGroups 让前端能提示。选静音而不是改成 duck，是因为静音是显式的、
+// 用户看得见的；duck 是静默替换，用户以为还是自己的音效。
+const ORIGINAL_DEL_FRAG = `              index.fragments = index.fragments.filter((f) => f.id !== id)
+              writeAudioIndex(index)
+              const p = audioFragmentPath(id)
+              if (p) { try { fs.unlinkSync(p) } catch (err) {} }
+              res.writeHead(200, JSON_HEADERS)
+              res.end(JSON.stringify({ ok: true, fragments: audioFragmentsPayload(), groups: audioGroupsPayload() }))
+              return
+`
+
+const PATCHED_DEL_FRAG = `              index.fragments = index.fragments.filter((f) => f.id !== id)
+              // 删片段必须让引用它的组进入**用户看得见**的状态：槽位置空（=该事件静音）。
+              // 不能把悬空引用留给 groupFragmentId() 静默回退成 duck 预设 —— 那样用户以为
+              // 还是自己的音效，实际响的是小黄鸭，界面上还显示一串原始 id。
+              const affectedGroups = []
+              if (Array.isArray(index.groups)) {
+                for (const g of index.groups) {
+                  if (!g || typeof g !== 'object') continue
+                  for (const slot of ['press', 'release']) {
+                    if (g[slot] === id) {
+                      g[slot] = ''
+                      affectedGroups.push({ id: String(g.id || ''), name: String(g.name || g.id || ''), slot })
+                    }
+                  }
+                }
+              }
+              writeAudioIndex(index)
+              const p = audioFragmentPath(id)
+              if (p) { try { fs.unlinkSync(p) } catch (err) {} }
+              res.writeHead(200, JSON_HEADERS)
+              res.end(JSON.stringify({ ok: true, fragments: audioFragmentsPayload(), groups: audioGroupsPayload(), affectedGroups }))
+              return
+`
+
 const NEW_ANCHORS = [
   {
     name: 'body 超限 413（readBodyLimited）',
@@ -1718,6 +1764,11 @@ const NEW_ANCHORS = [
     name: "SSRF 防护：usage 调用点传 allowLoopback",
     from: ORIGINAL_SSRF_USAGE, to: PATCHED_SSRF_USAGE, mark: PATCHED_SSRF_USAGE,
     hints: ["apiFetchJson(usageUrl","credentialMayGoTo(model, tpl, usageUrl)"],
+  },
+  {
+    name: "删片段清理组引用（悬空引用 → 留空）",
+    from: ORIGINAL_DEL_FRAG, to: PATCHED_DEL_FRAG, mark: 'const affectedGroups = []',
+    hints: ["index.fragments = index.fragments.filter((f) => f.id !== id)", "audioFragmentPath(id)", "audioGroupsPayload()"],
   },
 ]
 
@@ -2112,6 +2163,108 @@ try {
 const MARK_POLL_TURN_TAIL = `      pollLastTurn()
       pollWaitState()`
 
+// —— 第十五组（前端）：删片段后把「哪些组被置空」讲给用户听 ——
+// 后端把引用被删片段的槽位置空后，前端必须提示，否则用户只会发现音效「变了」，
+// 不知道是删片段导致的。组名是用户输入，进 toast 前按 configSaveFailNotice 同一套规则转义。
+const ORIGINAL_FRAG_DEL_NOTICE = `function resDelAudioFrag(id) {
+  var f = null
+  for (var i = 0; i < (audioFragments || []).length; i++) if (audioFragments[i].id === id) { f = audioFragments[i]; break }
+  showConfirm('确定删除音频片段「' + (f && f.name ? f.name : id) + '」吗？\\n引用该片段的音效组槽位会自动回退预设。', function () {
+    try {
+      fetch('/dsh-whale/audio.json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete-fragment', id: id }),
+      })
+        .then(function (r) { return r.json() })
+        .then(function (d) {
+          if (d && d.ok && Array.isArray(d.fragments)) {
+            audioFragments = d.fragments
+            if (Array.isArray(d.groups)) audioGroups = d.groups
+            renderAudioGroupPanel()
+            refreshTaskEndAfterAudio()
+            openResManager()
+          }
+        })
+        .catch(function () {})
+    } catch (err) {}
+  })
+}
+`
+
+const PATCHED_FRAG_DEL_NOTICE = `// 删除片段后必须让用户看见「哪些组的槽位被改成留空」。
+// 后端 delete-fragment 会把引用被删片段的 press/release 置空（=该事件静音），
+// 不提示的话用户只会发现音效「变了」，不知道是删片段导致的。
+// 组名是用户输入，进 toast 前按 configSaveFailNotice 的同一套规则转义。
+function audioFragDeleteNotice(fragName, affected) {
+  try {
+    if (!Array.isArray(affected) || !affected.length) return
+    var esc = function (s) {
+      return String(s == null ? '' : s).slice(0, 40)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    }
+    var parts = []
+    for (var i = 0; i < affected.length && i < 4; i++) {
+      var a = affected[i] || {}
+      parts.push(esc(a.name || a.id || '未命名') + '（' + (a.slot === 'release' ? '松开' : '按下') + '）')
+    }
+    var more = affected.length > 4 ? ' 等 ' + affected.length + ' 处' : ''
+    dshwvToast('已删除音频「' + esc(fragName) + '」；' + affected.length + ' 个音效组槽位已改为留空（不发声）：' +
+      parts.join('、') + more, 'ok', 5200)
+  } catch (err) {}
+}
+function resDelAudioFrag(id) {
+  var f = null
+  for (var i = 0; i < (audioFragments || []).length; i++) if (audioFragments[i].id === id) { f = audioFragments[i]; break }
+  var fragName = f && f.name ? f.name : id
+  showConfirm('确定删除音频片段「' + fragName + '」吗？\\n引用该片段的音效组槽位会改为留空（不发声）。', function () {
+    try {
+      fetch('/dsh-whale/audio.json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete-fragment', id: id }),
+      })
+        .then(function (r) { return r.json() })
+        .then(function (d) {
+          if (d && d.ok && Array.isArray(d.fragments)) {
+            audioFragments = d.fragments
+            if (Array.isArray(d.groups)) audioGroups = d.groups
+            renderAudioGroupPanel()
+            refreshTaskEndAfterAudio()
+            openResManager()
+            audioFragDeleteNotice(fragName, d.affectedGroups)
+          }
+        })
+        .catch(function () {})
+    } catch (err) {}
+  })
+}
+`
+
+// 槽位面板里删片段：编辑草稿不能回退成 ya1/ya2（那是静默替换成预设鸭叫），
+// 要与后端把已保存组的槽位置空保持一致 —— 置空后按钮显示「留空·不发声」，用户看得见。
+const ORIGINAL_FRAG_SLOT_DRAFT = `            // 若当前槽位引用被删，回退预设
+            if (slot === 'press' && audioEditPressVal === id) { audioEditPressVal = 'ya1'; audioSlotBtnText(audioEditPressBtn, 'ya1') }
+            if (slot === 'release' && audioEditReleaseVal === id) { audioEditReleaseVal = 'ya2'; audioSlotBtnText(audioEditReleaseBtn, 'ya2') }
+            // 重建试听音频：引用片段被删后若仍指向旧 URL 会失效（404/无声）
+            audioEditPreviewEnsure(true)
+            renderAudioGroupPanel()
+            if (activeSlotPanel) renderAudioSlotPanel(slot)
+            refreshTaskEndAfterAudio()
+`
+
+const PATCHED_FRAG_SLOT_DRAFT = `            // 若当前槽位引用被删：置空（=留空·不发声），与后端把已保存组的槽位置空保持一致。
+            // 不能回退成 ya1/ya2 —— 那是静默替换成预设鸭叫，用户会以为还是自己的音效。
+            if (slot === 'press' && audioEditPressVal === id) { audioEditPressVal = ''; audioSlotBtnText(audioEditPressBtn, '') }
+            if (slot === 'release' && audioEditReleaseVal === id) { audioEditReleaseVal = ''; audioSlotBtnText(audioEditReleaseBtn, '') }
+            // 重建试听音频：引用片段被删后若仍指向旧 URL 会失效（404/无声）
+            audioEditPreviewEnsure(true)
+            renderAudioGroupPanel()
+            if (activeSlotPanel) renderAudioSlotPanel(slot)
+            refreshTaskEndAfterAudio()
+            audioFragDeleteNotice(f.name, d.affectedGroups)
+`
+
 const FRONT_ANCHORS = [
   {
     file: FRONT_REL,
@@ -2202,6 +2355,18 @@ const FRONT_ANCHORS = [
     name: 'pollLastTurn 收尾 + 回前台补一次',
     from: ORIGINAL_POLL_TURN_TAIL, to: PATCHED_POLL_TURN_TAIL, mark: MARK_POLL_TURN_TAIL,
     hints: ['setInterval(function () { pollLastTurn(); pollWaitState() }, 1000)', 'visibilitychange'],
+  },
+  {
+    file: FRONT_REL,
+    name: '删片段后 toast 告知哪些组被置空',
+    from: ORIGINAL_FRAG_DEL_NOTICE, to: PATCHED_FRAG_DEL_NOTICE, mark: 'function audioFragDeleteNotice(',
+    hints: ['function resDelAudioFrag(id)', '引用该片段的音效组槽位会自动回退预设', 'openResManager()'],
+  },
+  {
+    file: FRONT_REL,
+    name: '槽位面板删片段：草稿置空而不是回退 ya1/ya2',
+    from: ORIGINAL_FRAG_SLOT_DRAFT, to: PATCHED_FRAG_SLOT_DRAFT, mark: 'audioFragDeleteNotice(f.name, d.affectedGroups)',
+    hints: ['若当前槽位引用被删，回退预设', 'audioEditPreviewEnsure(true)', 'refreshTaskEndAfterAudio()'],
   },
 ]
 
