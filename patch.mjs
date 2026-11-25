@@ -1,0 +1,384 @@
+#!/usr/bin/env node
+// dsh-whale-fence-patch —— 给已安装的 dsh-whale-widget 打信任栅栏兼容补丁。
+//
+// 只改 lib/index.js 里的两处：connectionFence() 与 rejected() 的栅栏分派。
+// 不复制、不分发上游任何代码或素材；素材仍由用户已安装的上游副本提供。
+//
+// 用法：
+//   node patch.mjs --profile web      # 指定 profile
+//   node patch.mjs                    # 遍历 ~/.dsh/profiles/*/node_modules/dsh-whale-widget
+//   node patch.mjs --path <dir>       # 直接指定插件目录
+//   node patch.mjs --check            # 只报告会改什么，不写
+//   node patch.mjs --revert           # 还原
+
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import { execFileSync } from 'node:child_process'
+
+const PKG = 'dsh-whale-widget'
+const TARGET_REL = path.join('lib', 'index.js')
+const BACKUP_REL = path.join('lib', 'index.js.bak')
+
+// —— 上游 0.4.2 原版的两段目标代码（逐字节匹配，不做模糊定位）——
+
+const ORIGINAL_FENCE = `    function connectionFence() {
+      try {
+        const conn = ctx.get('connection') || ctx.connection
+        return conn && typeof conn.requestRejection === 'function' ? conn : null
+      } catch (err) { return null }
+    }
+`
+
+const PATCHED_FENCE = `    // 宿主栅栏的两种形态：
+    //   · DSH <= 0.2.1：connection.requestRejection(req) -> number | undefined
+    //   · DSH >= 0.2.2-rc.2：connection.admit(req) -> { peer } | { rejection: 401|403|503 }
+    //     （0.2.2-rc.2 的迁移指南移除了 requestRejection，改用 admit）
+    // 只认前者会让新版宿主上这层恒为 null —— 401/503 被吞、trustedHosts 权威被误判 403。
+    function connectionFence() {
+      try {
+        const conn = ctx.get('connection') || ctx.connection
+        if (!conn) return null
+        if (typeof conn.requestRejection === 'function') return conn
+        if (typeof conn.admit === 'function') return conn
+        return null
+      } catch (err) { return null }
+    }
+`
+
+const ORIGINAL_DISPATCH = `      let code
+      try {
+        code = conn.requestRejection(req)
+      } catch (err) {
+`
+
+const PATCHED_DISPATCH = `      let code
+      try {
+        if (typeof conn.requestRejection === 'function') {
+          code = conn.requestRejection(req)
+        } else {
+          // admit 交回 Peer：{ peer } 放行，{ rejection } 原样透出。
+          // 非 owner 的 Peer 一律 403 —— 写配置等于决定"把凭据发往哪里"，
+          // 只有本机所有者能做（与 writeRejection 的意图一致）。
+          const admission = conn.admit({ headers: req.headers, method: req.method, url: req.url })
+          if (admission && admission.rejection) {
+            code = admission.rejection
+          } else if (admission && admission.peer) {
+            const kind = admission.peer.principal && admission.peer.principal.kind
+            code = kind !== undefined && kind !== 'owner' ? 403 : undefined
+          } else {
+            // admit 返回 undefined：这道实现不认得这次请求，不能当放行
+            code = 403
+          }
+        }
+      } catch (err) {
+`
+
+// 打过补丁才有的标记（用于幂等判定与 revert 反向替换）
+const MARK_FENCE = `        if (typeof conn.admit === 'function') return conn`
+const MARK_DISPATCH = `          const admission = conn.admit({ headers: req.headers, method: req.method, url: req.url })`
+
+// —— 参数 ——
+
+function parseArgs(argv) {
+  const opts = { profile: null, dir: null, check: false, revert: false, help: false }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--profile') opts.profile = argv[++i] ?? null
+    else if (a === '--path') opts.dir = argv[++i] ?? null
+    else if (a === '--check') opts.check = true
+    else if (a === '--revert') opts.revert = true
+    else if (a === '--help' || a === '-h') opts.help = true
+    else {
+      console.error(`未知参数：${a}`)
+      process.exit(2)
+    }
+  }
+  if (opts.profile && opts.dir) {
+    console.error('--profile 与 --path 不能同时使用')
+    process.exit(2)
+  }
+  return opts
+}
+
+const USAGE = `用法：
+  node patch.mjs --profile <name>   给 ~/.dsh/profiles/<name> 下的 dsh-whale-widget 打补丁
+  node patch.mjs                    遍历 ~/.dsh/profiles/*/node_modules/dsh-whale-widget
+  node patch.mjs --path <dir>       直接指定插件目录（或含 node_modules/dsh-whale-widget 的目录）
+  node patch.mjs --check            只报告会改什么，不写文件
+  node patch.mjs --revert           还原到打补丁前（优先用 lib/index.js.bak）`
+
+// —— 定位 ——
+
+function looksLikePlugin(dir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+    return pkg.name === PKG && fs.existsSync(path.join(dir, TARGET_REL))
+  } catch (err) { return false }
+}
+
+function resolveTargets(opts) {
+  if (opts.dir) {
+    const abs = path.resolve(opts.dir)
+    if (looksLikePlugin(abs)) return [abs]
+    const nested = path.join(abs, 'node_modules', PKG)
+    if (looksLikePlugin(nested)) return [nested]
+    if (fs.existsSync(path.join(abs, TARGET_REL))) return [abs] // 没有 package.json 也认，交给后面报错
+    console.error(`在 ${abs} 找不到 ${PKG}（既不是插件目录，也没有 node_modules/${PKG}）`)
+    process.exit(1)
+  }
+  const profilesRoot = path.join(os.homedir(), '.dsh', 'profiles')
+  if (opts.profile) {
+    const dir = path.join(profilesRoot, opts.profile, 'node_modules', PKG)
+    if (!looksLikePlugin(dir)) {
+      console.error(`profile "${opts.profile}" 下没有安装 ${PKG}：${dir}`)
+      process.exit(1)
+    }
+    return [dir]
+  }
+  let names = []
+  try { names = fs.readdirSync(profilesRoot) } catch (err) {
+    console.error(`读不到 ${profilesRoot}：${err.message}`)
+    process.exit(1)
+  }
+  const found = names
+    .map((n) => path.join(profilesRoot, n, 'node_modules', PKG))
+    .filter(looksLikePlugin)
+  if (found.length === 0) {
+    console.error(`在 ${profilesRoot}/*/node_modules/${PKG} 没找到已安装的插件。用 --path 指定目录。`)
+    process.exit(1)
+  }
+  return found
+}
+
+// —— 版本漂移保护 ——
+
+function countOf(hay, needle) {
+  let n = 0
+  let i = hay.indexOf(needle)
+  while (i >= 0) { n++; i = hay.indexOf(needle, i + 1) }
+  return n
+}
+
+function snippetAround(src, needles) {
+  const list = Array.isArray(needles) ? needles : [needles]
+  for (const needle of list) {
+    const i = src.indexOf(needle)
+    if (i < 0) continue
+    const start = Math.max(0, i - 200)
+    const end = Math.min(src.length, i + needle.length + 200)
+    const firstLine = src.slice(0, start).split('\n').length // 片段起始处的真实行号
+    return src.slice(start, end).split('\n')
+      .map((l, k) => `    ${String(firstLine + k).padStart(6)} | ${l.length > 160 ? l.slice(0, 160) + ' …' : l}`)
+      .join('\n')
+  }
+  return '    （连锚点都找不到）'
+}
+
+// 返回 { state: 'patched' | 'original' } 或抛错（漂移）
+function inspect(src) {
+  const hasFenceMark = src.includes(MARK_FENCE)
+  const hasDispatchMark = src.includes(MARK_DISPATCH)
+  if (hasFenceMark && hasDispatchMark) return { state: 'patched' }
+
+  if (hasFenceMark || hasDispatchMark) {
+    // 只打了一半：可能是别的补丁、或上游改过其中一处。不猜，直接失败。
+    const err = new Error(
+      '文件处于"半打补丁"状态：两处标记只命中一处。'
+      + `\n  connectionFence 已改：${hasFenceMark ? '是' : '否'}`
+      + `\n  rejected 分派已改：${hasDispatchMark ? '是' : '否'}`
+      + '\n  请先 --revert，或手动核对后再跑。',
+    )
+    err.drift = true
+    throw err
+  }
+
+  const fenceCount = countOf(src, ORIGINAL_FENCE)
+  const dispatchCount = countOf(src, ORIGINAL_DISPATCH)
+  if (fenceCount === 1 && dispatchCount === 1) return { state: 'original' }
+
+  // 两处都报，别让用户改完一处再撞第二处
+  const problems = []
+  if (fenceCount !== 1) {
+    problems.push(
+      `找不到 connectionFence() 的目标代码块（命中 ${fenceCount} 次，期望 1 次）。`
+      + '\n上游可能改过这段。实际找到的内容片段：\n'
+      + snippetAround(src, ['function connectionFence()', 'connectionFence']),
+    )
+  }
+  if (dispatchCount !== 1) {
+    problems.push(
+      `找不到 rejected() 里的栅栏分派代码块（命中 ${dispatchCount} 次，期望 1 次）。`
+      + '\n上游可能改过这段。实际找到的内容片段：\n'
+      + snippetAround(src, ['code = conn.requestRejection(req)', 'conn.requestRejection(req)', 'requestRejection']),
+    )
+  }
+  const err = new Error(problems.join('\n\n'))
+  err.drift = true
+  throw err
+}
+
+function applyPatch(src) {
+  return src.replace(ORIGINAL_FENCE, PATCHED_FENCE).replace(ORIGINAL_DISPATCH, PATCHED_DISPATCH)
+}
+
+function reversePatch(src) {
+  return src.replace(PATCHED_FENCE, ORIGINAL_FENCE).replace(PATCHED_DISPATCH, ORIGINAL_DISPATCH)
+}
+
+// —— 语法校验 ——
+
+function syntaxOk(file) {
+  try {
+    execFileSync(process.execPath, ['--check', file], { stdio: 'pipe' })
+    return { ok: true }
+  } catch (err) {
+    const msg = (err.stderr && err.stderr.toString()) || err.message
+    return { ok: false, msg: msg.trim().split('\n').slice(0, 6).join('\n') }
+  }
+}
+
+// —— 主流程 ——
+
+function readVersion(dir) {
+  try { return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version || '未知' } catch (err) { return '未知' }
+}
+
+function doPatch(dir, opts) {
+  const file = path.join(dir, TARGET_REL)
+  const backup = path.join(dir, BACKUP_REL)
+  const version = readVersion(dir)
+  console.log(`\n插件目录：${dir}`)
+  console.log(`上游版本：${PKG}@${version}`)
+
+  if (!fs.existsSync(file)) {
+    console.error(`缺少 ${file}`)
+    return 1
+  }
+  const src = fs.readFileSync(file, 'utf8')
+
+  let info
+  try { info = inspect(src) } catch (err) {
+    console.error(`\n失败：${err.message}`)
+    console.error('\n未写入任何文件。')
+    return 1
+  }
+
+  if (info.state === 'patched') {
+    console.log('状态：已是最新（补丁已在位），无需改动。')
+    return 0
+  }
+
+  const next = applyPatch(src)
+  if (next === src) {
+    console.error('失败：替换后内容未变化，说明锚点匹配异常。未写入。')
+    return 1
+  }
+  const added = next.split('\n').length - src.split('\n').length
+  console.log(`状态：待打补丁（将新增 ${added} 行）`)
+
+  if (opts.check) {
+    console.log('--check：只报告，不写文件。')
+    return 0
+  }
+
+  // 备份（已存在则不覆盖，保留最早的原始副本）
+  if (fs.existsSync(backup)) {
+    console.log(`备份：${BACKUP_REL} 已存在，保留不覆盖。`)
+  } else {
+    fs.writeFileSync(backup, src)
+    console.log(`备份：已写入 ${BACKUP_REL}`)
+  }
+
+  fs.writeFileSync(file, next)
+  const chk = syntaxOk(file)
+  if (!chk.ok) {
+    fs.writeFileSync(file, src)
+    console.error('失败：node --check 未通过，已回滚到原内容。')
+    console.error(chk.msg)
+    return 1
+  }
+  console.log('语法：node --check 通过')
+  console.log('完成：补丁已应用。重启 dsh 后生效。')
+  return 0
+}
+
+function doRevert(dir, opts) {
+  const file = path.join(dir, TARGET_REL)
+  const backup = path.join(dir, BACKUP_REL)
+  const version = readVersion(dir)
+  console.log(`\n插件目录：${dir}`)
+  console.log(`上游版本：${PKG}@${version}`)
+
+  if (!fs.existsSync(file)) {
+    console.error(`缺少 ${file}`)
+    return 1
+  }
+  const src = fs.readFileSync(file, 'utf8')
+
+  // 先看当前状态：本来就是原版就直接收工，别把备份再写一遍
+  let current = null
+  try { current = inspect(src) } catch (err) { current = null }
+  if (current && current.state === 'original') {
+    console.log('状态：本来就是原版（补丁不在位），无需还原。')
+    return 0
+  }
+
+  let target = null
+  let how = ''
+  if (fs.existsSync(backup)) {
+    const bak = fs.readFileSync(backup, 'utf8')
+    // 备份必须是"未打补丁"的原版，否则不用它（避免把别的状态写回去）
+    let bakClean = false
+    try { bakClean = inspect(bak).state === 'original' } catch (err) { bakClean = false }
+    if (bakClean) { target = bak; how = `备份文件 ${BACKUP_REL} ` }
+  }
+  if (target === null) {
+    let info
+    try { info = inspect(src) } catch (err) {
+      console.error(`\n失败：${err.message}`)
+      console.error('\n未写入任何文件。')
+      return 1
+    }
+    if (info.state === 'original') {
+      console.log('状态：本来就是原版（补丁不在位），无需还原。')
+      return 0
+    }
+    target = reversePatch(src)
+    how = '反向替换'
+    if (target === src) {
+      console.error('失败：反向替换未产生变化。未写入。')
+      return 1
+    }
+  }
+
+  if (opts.check) {
+    console.log(`--check：将用${how}还原，不写文件。`)
+    return 0
+  }
+
+  fs.writeFileSync(file, target)
+  const chk = syntaxOk(file)
+  if (!chk.ok) {
+    fs.writeFileSync(file, src)
+    console.error('失败：还原后 node --check 未通过，已回滚。')
+    console.error(chk.msg)
+    return 1
+  }
+  console.log(`还原：已用${how}还原 ${TARGET_REL}`)
+  console.log('语法：node --check 通过')
+  return 0
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2))
+  if (opts.help) { console.log(USAGE); return 0 }
+  const targets = resolveTargets(opts)
+  let rc = 0
+  for (const dir of targets) {
+    rc = (opts.revert ? doRevert(dir, opts) : doPatch(dir, opts)) || rc
+  }
+  return rc
+}
+
+process.exit(main())
