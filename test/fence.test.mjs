@@ -474,3 +474,246 @@ test('serveSound 有 Array.isArray 第二道防线', () => {
     'serveSound 必须先判 Array.isArray 再交给 loadSound',
   )
 })
+
+// ============ 新增锚点（第五~八处）的回归测试 ============
+//
+// 这几处不涉及栅栏，测法分两类：
+//   · 行为类：把函数段抽出来，注入假 req/res/fs 真跑一遍（body 超限、方法守卫、损坏备份）；
+//   · 静态类：节假日表与下发字段直接对源码断言（纯数据，跑起来没有额外信息量）。
+
+// —— 第五处：body 超限返回 413 ——
+
+const BODY_START = '    // 读请求体，超过上限时抛一个带 status=413 的错误。'
+const BODY_END = '    // —— 自定义角色存储：whale-roles/ 目录，每个角色一个 <id>.png + roles.json 索引 ——'
+const bodyA = src.indexOf(BODY_START)
+const bodyB = src.indexOf(BODY_END)
+if (bodyA < 0 || bodyB < 0) {
+  console.error(`在 ${targetFile} 里找不到 readBodyLimited 代码段的边界。`)
+  process.exit(1)
+}
+const bodyBlock = src.slice(bodyA, bodyB)
+if (!bodyBlock.includes('error.status = 413')) {
+  console.error(`${targetFile} 里没有 status=413 —— body 补丁未应用，先跑 node patch.mjs。`)
+  process.exit(1)
+}
+
+// 假 req：按 chunk 逐个 emit，记录 destroy / resume 调用
+function makeFakeReq(chunks) {
+  const handlers = {}
+  const state = { destroyed: false, resumed: false }
+  const req = {
+    on(ev, fn) { (handlers[ev] = handlers[ev] || []).push(fn); return req },
+    destroy() { state.destroyed = true },
+    resume() { state.resumed = true },
+  }
+  const emit = (ev, arg) => (handlers[ev] || []).forEach((fn) => fn(arg))
+  return {
+    req, state,
+    // 模拟 Node 的 flowing 模式：data 事件同步派发，最后 end
+    feed() {
+      for (const c of chunks) emit('data', Buffer.from(c))
+      emit('end')
+    },
+  }
+}
+
+const bodyFactory = new Function(`
+${bodyBlock}
+return { readBody, readBodyMax, readBodyLimited }
+`)
+const bodyFns = bodyFactory()
+
+test('readBodyMax 超限：错误带 status=413，且不 destroy socket', async () => {
+  const { req, state, feed } = makeFakeReq(['x'.repeat(600 * 1024)])
+  const p = bodyFns.readBodyMax(req, 512 * 1024)
+  feed()
+  let err = null
+  try { await p } catch (e) { err = e }
+  assert.ok(err, '超限必须 reject')
+  assert.equal(err.status, 413, `错误必须带 status=413，实际 ${err.status}`)
+  assert.equal(state.destroyed, false, '超限时不能 req.destroy()（否则 413 到不了客户端）')
+  assert.equal(state.resumed, true, '超限时必须 req.resume() 排空剩余 body')
+})
+
+test('readBody 超限（8192 上限）同样带 413', async () => {
+  const { req, state, feed } = makeFakeReq(['y'.repeat(9000)])
+  const p = bodyFns.readBody(req)
+  feed()
+  let err = null
+  try { await p } catch (e) { err = e }
+  assert.equal(err && err.status, 413)
+  assert.equal(state.destroyed, false)
+})
+
+test('未超限时正常返回 body 文本（不回归）', async () => {
+  const { req, feed } = makeFakeReq(['{"a":', '1}'])
+  const p = bodyFns.readBodyMax(req, 8192)
+  feed()
+  assert.equal(await p, '{"a":1}')
+})
+
+test('恰好等于上限不算超限（边界）', async () => {
+  const { req, feed } = makeFakeReq(['z'.repeat(8192)])
+  const p = bodyFns.readBodyMax(req, 8192)
+  feed()
+  assert.equal((await p).length, 8192)
+})
+
+test('超限后不再 resolve（overflow 后 end 不覆盖 reject）', async () => {
+  const { req, feed } = makeFakeReq(['w'.repeat(9000), 'more'])
+  const p = bodyFns.readBodyMax(req, 8192)
+  feed()
+  let settled = null
+  try { settled = { ok: await p } } catch (e) { settled = { err: e } }
+  assert.ok(settled.err, '必须落在 reject 分支')
+  assert.equal(settled.err.status, 413)
+})
+
+test('9 处 catch 都透出 err.status，业务 400 保持原样', () => {
+  // 打过补丁的文件里，err.status || 400 必须恰好出现 10 次
+  // （9 处新增 + 1 处上游原本就有）
+  const n = (src.match(/res\.writeHead\(err\.status \|\| 400, JSON_HEADERS\)/g) || []).length
+  assert.equal(n, 10, `err.status || 400 应出现 10 次，实际 ${n} 次`)
+
+  // 业务错误必须仍是裸 400：这些不是 readBodyMax 抛的，没有 status
+  for (const msg of ['cannot delete default role', 'invalid image data', 'unknown action',
+                     'cannot delete preset group', 'cannot delete preset fragment',
+                     'invalid bubble config', 'image too large', 'audio too large',
+                     'missing scale']) {
+    const re = new RegExp(`res\\.writeHead\\(400, JSON_HEADERS\\)\\n\\s*res\\.end\\(JSON\\.stringify\\(\\{ ok: false, error: '${msg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'`)
+    assert.ok(re.test(src), `业务错误「${msg}」必须保持 400，不能被改成 err.status || 400`)
+  }
+})
+
+// —— 第六处：三个 POST-only 路由的方法守卫 ——
+
+const GUARD_ROUTES = ['role-pin.json', 'role-delete.json', 'bubble-img-upload.json']
+
+test('三个 POST-only 路由都有方法守卫（GET → 405）', () => {
+  for (const route of GUARD_ROUTES) {
+    const i = src.indexOf(`path: '/dsh-whale/${route}'`)
+    assert.ok(i >= 0, `找不到路由 ${route}`)
+    const seg = src.slice(i, i + 900)
+    assert.ok(
+      /if \(req\.method !== 'POST' && req\.method !== 'PUT'\) \{/.test(seg),
+      `${route} 缺少方法守卫`,
+    )
+    assert.ok(
+      /res\.writeHead\(405, \{ \.\.\.JSON_HEADERS, Allow: 'POST, PUT' \}\)/.test(seg),
+      `${route} 的 405 必须带 Allow: POST, PUT`,
+    )
+  }
+})
+
+test('有 GET 只读分支的路由不加方法守卫（不误伤）', () => {
+  for (const route of ['roles.json', 'audio.json', 'bubble.json']) {
+    const i = src.indexOf(`path: '/dsh-whale/${route}'`)
+    assert.ok(i >= 0, `找不到路由 ${route}`)
+    const seg = src.slice(i, i + 900)
+    assert.ok(
+      !/if \(req\.method !== 'POST' && req\.method !== 'PUT'\) \{/.test(seg),
+      `${route} 有 GET 只读分支，不能加 POST/PUT 守卫`,
+    )
+  }
+})
+
+// —— 第七处：2027 年节假日 ——
+
+test('HOLIDAY_VALLEY 含 29 条 2027 日期', () => {
+  const i = src.indexOf('const HOLIDAY_VALLEY = {')
+  const j = src.indexOf('\n}', i)
+  const table = src.slice(i, j)
+  const y2027 = [...table.matchAll(/'2027-\d{2}-\d{2}': 1/g)]
+  assert.equal(y2027.length, 29, `2027 年应有 29 条，实际 ${y2027.length} 条`)
+  // 2026 的 33 条不能被删
+  const y2026 = [...table.matchAll(/'2026-\d{2}-\d{2}': 1/g)]
+  assert.equal(y2026.length, 33, `2026 年应有 33 条，实际 ${y2026.length} 条`)
+})
+
+test('HOLIDAY_VALLEY_COVERED_THROUGH 为 2027-12-31 且已下发', () => {
+  assert.ok(
+    /const HOLIDAY_VALLEY_COVERED_THROUGH = '2027-12-31'/.test(src),
+    '必须声明 HOLIDAY_VALLEY_COVERED_THROUGH = 2027-12-31',
+  )
+  assert.ok(
+    /peakHolidaysCoveredThrough: HOLIDAY_VALLEY_COVERED_THROUGH,/.test(src),
+    'balance 响应里必须下发 peakHolidaysCoveredThrough',
+  )
+})
+
+// —— 第八处：配置文件损坏备份 ——
+
+const BACKUP_START = '    function backupCorruptFile(p, why, tag) {'
+const BACKUP_END = '    function readUsageLedger() {'
+const backupA = src.indexOf(BACKUP_START)
+const backupB = src.indexOf(BACKUP_END)
+if (backupA < 0 || backupB < 0) {
+  console.error(`在 ${targetFile} 里找不到 backupCorruptFile 的边界。`)
+  process.exit(1)
+}
+const backupBlock = src.slice(backupA, backupB)
+
+test('backupCorruptFile 把坏文件改名成 .corrupt-<时间戳>.bak', () => {
+  const calls = []
+  const fakeFs = {
+    renameSync(from, to) { calls.push([from, to]) },
+  }
+  const logs = []
+  const factory = new Function('fs', 'console', `
+${backupBlock}
+return backupCorruptFile
+`)
+  const backup = factory(fakeFs, { error: (...a) => logs.push(a.join(' ')) })
+  const bak = backup('/tmp/x/.dshw-bubble.json', 'bad-json', 'whale-bubble')
+  assert.equal(calls.length, 1, '必须调用一次 renameSync')
+  assert.equal(calls[0][0], '/tmp/x/.dshw-bubble.json')
+  assert.match(calls[0][1], /^\/tmp\/x\/\.dshw-bubble\.json\.corrupt-\d+\.bak$/, '备份名必须是 .corrupt-<时间戳>.bak')
+  assert.equal(bak, calls[0][1], '必须返回备份路径')
+  assert.ok(logs.some((l) => l.includes('[whale-bubble]') && l.includes('bad-json')), '必须打带 tag 与原因的日志')
+})
+
+test('backupCorruptFile 备份失败不抛（只打日志）', () => {
+  const fakeFs = { renameSync() { const e = new Error('EACCES'); e.code = 'EACCES'; throw e } }
+  const logs = []
+  const factory = new Function('fs', 'console', `
+${backupBlock}
+return backupCorruptFile
+`)
+  const backup = factory(fakeFs, { error: (...a) => logs.push(a.join(' ')) })
+  let threw = null
+  let ret
+  try { ret = backup('/tmp/x/y.json', 'bad-json', 'whale-roles') } catch (e) { threw = e }
+  assert.equal(threw, null, '备份失败不能抛异常（否则插件整个挂掉）')
+  assert.equal(ret, null)
+  assert.ok(logs.some((l) => l.includes('EACCES')), '必须把失败原因打进日志')
+})
+
+test('四个读取函数都调 backupCorruptFile，且区分 bad-json / bad-structure', () => {
+  const readers = [
+    ['readRolesIndex', 'whale-roles'],
+    ['readAudioIndex', 'whale-audio'],
+    ['readBubbleImgIndex', 'whale-bubble-imgs'],
+    ['loadBubbleConfig', 'whale-bubble'],
+  ]
+  for (const [fn, tag] of readers) {
+    const i = src.indexOf(`function ${fn}()`)
+    assert.ok(i >= 0, `找不到 ${fn}`)
+    // 取到下一个顶层 function 声明为止
+    const rest = src.slice(i + 10)
+    const nextFn = rest.search(/\n    function /)
+    const seg = rest.slice(0, nextFn < 0 ? 2000 : nextFn)
+    assert.ok(seg.includes(`backupCorruptFile(p, 'bad-json', '${tag}')`), `${fn} 缺 bad-json 备份（tag=${tag}）`)
+    assert.ok(seg.includes(`backupCorruptFile(p, 'bad-structure', '${tag}')`), `${fn} 缺 bad-structure 备份（tag=${tag}）`)
+    assert.ok(/err\.code !== 'ENOENT'/.test(seg), `${fn} 必须跳过 ENOENT（首次运行不是损坏）`)
+  }
+})
+
+test('四个读取函数不再有空的 catch (err) {} 吞掉解析错误', () => {
+  for (const fn of ['readRolesIndex', 'readAudioIndex', 'readBubbleImgIndex', 'loadBubbleConfig']) {
+    const i = src.indexOf(`function ${fn}()`)
+    const rest = src.slice(i + 10)
+    const nextFn = rest.search(/\n    function /)
+    const seg = rest.slice(0, nextFn < 0 ? 2000 : nextFn)
+    assert.ok(!/catch \(err\) \{\}/.test(seg), `${fn} 里仍有空 catch，坏文件会被静默覆盖`)
+  }
+})
