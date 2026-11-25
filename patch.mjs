@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // dsh-whale-fence-patch —— 给已安装的 dsh-whale-widget 打上游 bug 的补丁。
 //
-// 改 lib/index.js 里的八组（共 28 个锚点）：
+// 改 lib/index.js 里的十组（共 30 个锚点）：
 //   ① connectionFence()           —— 栅栏兼容（DSH >= 0.2.2-rc.2 的 admit）
 //   ② rejected() 的栅栏分派        —— 同上
 //   ③ root.inject 列表             —— 补 connection.authentication，否则 admit 恒抛
@@ -11,6 +11,7 @@
 //   ⑦ 2027 年节假日 + 覆盖终点下发   —— HOLIDAY_VALLEY 补 29 条，下发 peakHolidaysCoveredThrough
 //   ⑧ 配置文件损坏备份              —— backupCorruptFile + 四个读取函数
 //   ⑨ waitState 跨会话状态污染       —— 按会话分桶 + waitView() 选一个会话上报（子 agent 不再清主会话挂起）
+//   ⑩ 账本 IO 退避 + update-check 去重 —— Atomics.wait 退避 305ms→25ms；并发只打一轮上游
 // 不复制、不分发上游任何代码或素材；素材仍由用户已安装的上游副本提供。
 //
 // 用法：
@@ -961,6 +962,203 @@ const PATCHED_DISPOSED = `    disposers.push(ctx.on('session/disposed', (session
 //   to    补丁后的代码块（revert 时反向替换，也必须恰好出现 1 次）
 //   mark  打过补丁才有的标记，用于幂等判定与半打补丁检测
 //   hints 漂移时用来打印"实际找到的片段"的搜索串
+// ⑩ 账本 IO 退避 + update-check in-flight 去重
+const ORIGINAL_LEDGER_IO = `    // Windows indexers can briefly hold a just-written file. Retry sharing
+    // conflicts; never treat an unreadable existing ledger as an empty ledger.
+    function ledgerIo(operation) {
+      for (let attempt = 0; ; attempt++) {
+        try { return operation() } catch (err) {
+          if (attempt >= 5 || !['EBUSY', 'EPERM', 'EACCES'].includes(err.code)) throw err
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1))
+        }
+      }
+    }`
+
+const PATCHED_LEDGER_IO = `    // Windows indexers can briefly hold a just-written file. Retry sharing
+    // conflicts; never treat an unreadable existing ledger as an empty ledger.
+    //
+    // ⚠️ 退避**必须短**：本函数是同步的，\`Atomics.wait\` 在 Node 主线程上是真阻塞，
+    //   而插件跑在 DSH 宿主进程里 —— 阻塞多久，模型流式输出就卡多久（同文件 4001 行
+    //   \`npmCliVersion\` 的注释讲的是同一个坑）。旧值 \`20 * (attempt + 1)\` 单次操作最坏
+    //   20+40+60+80+100 = 305ms，而 \`writeUsageLedger\` 一次写盘要过 4 个 ledgerIo
+    //   （读旧账本 / 备份 / 写临时文件 / rename），最坏累计 1220ms。
+    //   现在改成固定 5ms × 5 次 = 单次操作最坏 25ms，一次写盘最坏 100ms。
+    //   取舍：重试耐心从 305ms 降到 25ms，Windows 索引器占用超过 25ms 时写盘会失败
+    //   （\`writeUsageLedger\` 返回 false，调用方按既有逻辑报错/下次再写），
+    //   换来的是宿主事件循环不会被账本 IO 拖住。彻底解法是把整条账本链 async 化，
+    //   但 \`readUsageLedger\` 被 \`publicBalance\` / \`recordLedgerUsage\` / \`aboutPayload\` /
+    //   \`readUsageSettings\` 等 12 处同步函数调用，改动面远大于本 bug 的收益。
+    const LEDGER_RETRY_WAIT_MS = 5
+    const LEDGER_RETRY_LIMIT = 5
+    function ledgerIo(operation) {
+      for (let attempt = 0; ; attempt++) {
+        try { return operation() } catch (err) {
+          if (attempt >= LEDGER_RETRY_LIMIT || !['EBUSY', 'EPERM', 'EACCES'].includes(err.code)) throw err
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LEDGER_RETRY_WAIT_MS)
+        }
+      }
+    }`
+
+const ORIGINAL_UPDATE_CHECK = `    let updateCheckCache = null
+    disposers.push(registerRoute({
+      kind: 'exact',
+      path: '/dsh-whale/update-check.json',
+      handler: async (req, res) => {
+        const now = Date.now()
+        try {
+          if (updateCheckCache && now - updateCheckCache.at < 10 * 60 * 1000) {
+            res.writeHead(200, JSON_HEADERS)
+            res.end(JSON.stringify(updateCheckCache.payload))
+            return
+          }
+        } catch (err) {}
+        let payload = null
+        // v802：四个源**并行**试（单个源实测很不稳：npmmirror/jsdelivr 会超时、unpkg 会 302），
+        //   并行后最坏也就 5 秒（串行会是 20 秒），谁先成功用谁，全失败就把每个源的原因都列出来。
+        const results = await Promise.all(UPDATE_SOURCES.map(async (src) => {
+          // v803：失败得**很快**（<1.5s，多为 DNS/连接抖动）就再试一次；超时那种就不重试了（不然最坏翻倍）
+          const attempt = async () => {
+            const t0 = Date.now()
+            if (src.cli) return { v: await npmCliVersion(8000), ms: Date.now() - t0 }
+            const j = await httpsGetJson(src.url, 5000, 0)
+            const latest = String((j && j.version) || '')
+            if (!latest) throw new Error('返回里没有 version')
+            return { v: latest, ms: Date.now() - t0 }
+          }
+          try {
+            const a = await attempt()
+            return { ok: true, name: src.name, latest: a.v }
+          } catch (err1) {
+            // 只在"失败得很快"（<1.5s，多为连接抖动）时重试一次；超时那种不重试，避免最坏耗时翻倍
+            const fast = !(err1 && /超时/.test(String(err1.message || '')))
+            if (!fast) return { ok: false, name: src.name, why: String((err1 && err1.message) || err1).slice(0, 40) }
+            try {
+              const a2 = await attempt()
+              return { ok: true, name: src.name, latest: a2.v }
+            } catch (err2) {
+              return { ok: false, name: src.name, why: String((err2 && err2.message) || err2).slice(0, 40) }
+            }
+          }
+        }))
+        const hit = results.filter((r) => r.ok)[0]
+        if (hit) {
+          payload = {
+            ok: true,
+            current: BUILD_VERSION,
+            channel: BUILD_CHANNEL,
+            latest: hit.latest,
+            hasUpdate: hit.latest !== BUILD_VERSION,
+            source: hit.name,
+          }
+        } else {
+          // 全失败 ⇒ 把**每一个源**的原因都列出来（只报最后一个会让人以为只有 npmjs 挂了）
+          payload = {
+            ok: false,
+            current: BUILD_VERSION,
+            error: results.map((r) => r.name + '：' + r.why).join('；'),
+            tried: UPDATE_SOURCES.map((s) => s.name),
+          }
+        }
+        try { updateCheckCache = { at: now, payload: payload } } catch (err) {}
+        res.writeHead(200, JSON_HEADERS)
+        res.end(JSON.stringify(payload))
+      },
+    }))`
+
+const PATCHED_UPDATE_CHECK = `    let updateCheckCache = null
+    // v862：in-flight 去重。缓存只在**完成后**才写，所以 N 个并发请求同时 miss 时，
+    //   旧代码会各自发起 5 个上游（4 个 https + 1 个 \`npm view\` 子进程）—— 8 并发就是
+    //   40 个外部请求 + 8 个 npm 子进程，等于自己打自己。\`balance.json\` 早有
+    //   \`balanceInFlight\`（3195 行附近）做同一件事，这里补齐。
+    //   ⚠️ 清空**由 promise 自己负责**（IIFE 的 finally 里），不能放在 handler 的
+    //   finally 里：handler 的 finally 由"第一个等到结果的请求"执行，它清空后，
+    //   仍在 await 同一 promise 的请求不受影响，但**新到达**的请求会重新发起一轮。
+    //   放在 IIFE 里则是在 promise settle 之前清空，此时 \`updateCheckCache\` 已经写好，
+    //   新到达的请求直接命中缓存，不会重复打上游。
+    let updateCheckInFlight = null
+    disposers.push(registerRoute({
+      kind: 'exact',
+      path: '/dsh-whale/update-check.json',
+      handler: async (req, res) => {
+        const now = Date.now()
+        try {
+          if (updateCheckCache && now - updateCheckCache.at < 10 * 60 * 1000) {
+            res.writeHead(200, JSON_HEADERS)
+            res.end(JSON.stringify(updateCheckCache.payload))
+            return
+          }
+        } catch (err) {}
+        if (!updateCheckInFlight) updateCheckInFlight = runUpdateCheck(now)
+        let payload = null
+        try {
+          payload = await updateCheckInFlight
+        } catch (err) {
+          // runUpdateCheck 内部已兜底，这里只防御"连兜底都抛"的极端情况
+          payload = { ok: false, current: BUILD_VERSION, error: String((err && err.message) || err).slice(0, 160) }
+        }
+        res.writeHead(200, JSON_HEADERS)
+        res.end(JSON.stringify(payload))
+      },
+    }))
+    // 真正打上游的那一轮。**同一时刻只允许一个**（由 updateCheckInFlight 保证）。
+    async function runUpdateCheck(now) {
+      try {
+        let payload = null
+        // v802：四个源**并行**试（单个源实测很不稳：npmmirror/jsdelivr 会超时、unpkg 会 302），
+        //   并行后最坏也就 5 秒（串行会是 20 秒），谁先成功用谁，全失败就把每个源的原因都列出来。
+        const results = await Promise.all(UPDATE_SOURCES.map(async (src) => {
+          // v803：失败得**很快**（<1.5s，多为 DNS/连接抖动）就再试一次；超时那种就不重试了（不然最坏翻倍）
+          const attempt = async () => {
+            const t0 = Date.now()
+            if (src.cli) return { v: await npmCliVersion(8000), ms: Date.now() - t0 }
+            const j = await httpsGetJson(src.url, 5000, 0)
+            const latest = String((j && j.version) || '')
+            if (!latest) throw new Error('返回里没有 version')
+            return { v: latest, ms: Date.now() - t0 }
+          }
+          try {
+            const a = await attempt()
+            return { ok: true, name: src.name, latest: a.v }
+          } catch (err1) {
+            // 只在"失败得很快"（<1.5s，多为连接抖动）时重试一次；超时那种不重试，避免最坏耗时翻倍
+            const fast = !(err1 && /超时/.test(String(err1.message || '')))
+            if (!fast) return { ok: false, name: src.name, why: String((err1 && err1.message) || err1).slice(0, 40) }
+            try {
+              const a2 = await attempt()
+              return { ok: true, name: src.name, latest: a2.v }
+            } catch (err2) {
+              return { ok: false, name: src.name, why: String((err2 && err2.message) || err2).slice(0, 40) }
+            }
+          }
+        }))
+        const hit = results.filter((r) => r.ok)[0]
+        if (hit) {
+          payload = {
+            ok: true,
+            current: BUILD_VERSION,
+            channel: BUILD_CHANNEL,
+            latest: hit.latest,
+            hasUpdate: hit.latest !== BUILD_VERSION,
+            source: hit.name,
+          }
+        } else {
+          // 全失败 ⇒ 把**每一个源**的原因都列出来（只报最后一个会让人以为只有 npmjs 挂了）
+          payload = {
+            ok: false,
+            current: BUILD_VERSION,
+            error: results.map((r) => r.name + '：' + r.why).join('；'),
+            tried: UPDATE_SOURCES.map((s) => s.name),
+          }
+        }
+        try { updateCheckCache = { at: now, payload: payload } } catch (err) {}
+        return payload
+      } finally {
+        // 在 promise settle **之前**清空：此刻 updateCheckCache 已写好，
+        // 新到达的请求会命中缓存而不是再打一轮上游。
+        updateCheckInFlight = null
+      }
+    }`
+
 const NEW_ANCHORS = [
   {
     name: 'body 超限 413（readBodyLimited）',
@@ -1080,6 +1278,16 @@ const NEW_ANCHORS = [
     name: 'session/disposed 清理挂起桶',
     from: ORIGINAL_DISPOSED, to: PATCHED_DISPOSED, mark: 'waitStates.delete(gone)',
     hints: ["ctx.on('session/disposed'", 'turnAggs.delete(session.id)', 'session/disposed'],
+  },
+  {
+    name: '账本 IO 退避不再长阻塞事件循环',
+    from: ORIGINAL_LEDGER_IO, to: PATCHED_LEDGER_IO, mark: 'const LEDGER_RETRY_WAIT_MS = 5',
+    hints: ['function ledgerIo(operation)', 'Atomics.wait', 'EBUSY'],
+  },
+  {
+    name: 'update-check 并发 in-flight 去重',
+    from: ORIGINAL_UPDATE_CHECK, to: PATCHED_UPDATE_CHECK, mark: 'let updateCheckInFlight = null',
+    hints: ['let updateCheckCache = null', 'Promise.all(UPDATE_SOURCES', 'update-check.json'],
   },
 
 ]
