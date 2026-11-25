@@ -2,7 +2,7 @@
 
 > **社区补丁，非上游官方。** 上游 `dsh-whale-widget` 自 0.4.2（2026-10-11）起没有新版本，本仓库是第三方临时方案。上游修复后请卸载。
 
-给已安装的 [`dsh-whale-widget`](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) 打上游 bug 的补丁，共七组：
+给已安装的 [`dsh-whale-widget`](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) 打上游 bug 的补丁，共八组：
 
 | # | 修的问题 | 锚点数 | 净增行 |
 |---|---|---|---|
@@ -12,8 +12,9 @@
 | ⑥ | **三个 POST-only 路由加方法守卫** —— GET 打进来 405 而不是 400 | 3 | +18 |
 | ⑦ | **2027 年节假日 + 覆盖终点下发** —— 节假日表只到 2026-10-07 | 2 | +32 |
 | ⑧ | **配置文件损坏备份** —— 坏 JSON 被静默覆盖，数据永久丢失 | 5 | +41 |
+| ⑨ | **waitState 跨会话状态污染** —— 子 agent 一开跑就清掉主会话的提问气泡 | 4 | +64 |
 
-共 **24 个锚点**。① ② ③ 是同一组（栅栏），④ 与栅栏无关，⑤~⑧ 是另外四个独立 bug。
+共 **28 个锚点**。① ② ③ 是同一组（栅栏），④ 与栅栏无关，⑤~⑨ 是另外五个独立 bug。
 
 **本仓库不包含上游的任何代码或素材**，只有一个改写脚本（`patch.mjs`）和它的测试。脚本就地修改你机器上已经装好的那份上游副本，素材仍然用上游的。
 
@@ -389,6 +390,61 @@ $ ls /tmp/final-home/.dshw-bubble.json*
 ```
 
 
+## 第九处：waitState 跨会话状态污染
+
+### 症状
+
+主会话正在等用户回答提问（挂件显示"等待输入"气泡），此时子 agent 开始跑 —— 气泡消失、对话名变成子 agent 的。用户以为提问被取消了，于是不去回答，主会话就一直卡着。
+
+### 根因
+
+挂起状态是**单个全局对象**，而 `session/event` 监听器覆盖**所有会话**（含子 agent）：
+
+```js
+const waitState = { pending: null, sessionName: "" }
+```
+
+`notePendingEvent(sid, event, session)` 里三处都写这个全局槽位：
+
+```js
+waitState.sessionName = ...                                  // 任何会话的标题都会覆盖
+waitState.pending = { kind: 'question', ..., session: sid }  // 带了 session 字段，但清除时从不检查
+if (type === 'turn/end' || type === 'turn/start') waitState.pending = null   // 无条件清除
+```
+
+所以子 agent 的 `turn/start` 会把主会话的挂起清掉。复现（`diag/waitstate-before.mjs`，跑在上游原版上）：
+
+```
+主会话提问后 waitState = {"pending":{"kind":"question","id":"q1",...,"session":"main"},"sessionName":"主会话"}
+子 agent turn/start 后 waitState = {"pending":null,"sessionName":"子agent"}
+```
+
+### 修法
+
+按会话分桶（`Map<sid, { pending, sessionName, lastTs }>`），再用 `waitView()` **选一个**会话上报 —— 挂件只有一个气泡，最终仍要选一个：
+
+- **有挂起的会话优先**（多个挂起取最近的一条）；
+- 都没有挂起时，回落到最近有事件的会话（只为拿 `sessionName`）。
+
+⚠️ 只按"最近有事件的会话"选是**不够**的：子 agent 一开跑就成了最近会话，主会话的提问气泡照样消失 —— 那正是本 bug。挂起优先级是修复的必要条件。
+
+⚠️ 子 agent 的挂起**不**按 `subagentMuteOn()` 静音：那个开关管的是"子智能体**完成**时不提示"（已经结束、只是告知），而挂起是"卡住等用户动手"，静音等于让子 agent 永久挂死且用户毫无信号。另外子代理不允许提问，所以 `question` 类实际只来自主会话；能走到这里的子 agent 挂起只可能是 `approval` —— 那恰恰最该让用户看见。
+
+四处锚点：① 状态定义（+`waitBucket`/`waitView`）② `notePendingEvent` ③ `wait.json` 响应体 ④ `session/disposed` 清理（避免已销毁会话的条目长期堆积，另有 200 条上限按 `lastTs` 淘汰）。
+
+`wait.json` 的返回结构**不变**（`{ ok, pending, sessionName }`），前端 `assets/whale-widget.js` 只读这两个字段，不需要改。
+
+### 验证结果
+
+```
+$ node diag/waitstate-before.mjs      # 上游原版：bug 复现
+$ node diag/waitstate-check.mjs       # 修复后：45 通过 / 0 失败
+$ node diag/waitstate-e2e-module.mjs  # 加载真实模块跑真实注册路径：19 通过 / 0 失败
+```
+
+变异测试（把 `st.pending = null` 改回"清所有会话"）：4 条用例变红，说明用例真的咬得住。
+
+
 ## 安装
 
 ```bash
@@ -399,7 +455,7 @@ node patch.mjs --profile web
 
 1. 定位 `~/.dsh/profiles/web/node_modules/dsh-whale-widget`；
 2. 读 `package.json` 打印版本号；
-3. 逐字节匹配上游 0.4.2 的 **24 个锚点**，任何一个找不到就**失败退出**（不猜位置）；
+3. 逐字节匹配上游 0.4.2 的 **28 个锚点**，任何一个找不到就**失败退出**（不猜位置）；
 4. 备份原文件到 `lib/index.js.bak`（已存在则不覆盖）；
 5. 写入补丁，跑 `node --check` 验证语法，不通过则回滚。
 
@@ -447,7 +503,7 @@ node test/fence.test.mjs --path ~/.dsh/profiles/web/node_modules/dsh-whale-widge
 - 静态断言：剥掉注释后不再有裸的 `SOUND_SETS[userInput]` 查表，两个 handler 都用 `Object.hasOwn`；
 - 静态断言：`serveSound` 有 `Array.isArray` 第二道防线。
 
-第五~八处（新增锚点）的测试分两类：
+第五~九处（新增锚点）的测试分两类：
 
 **行为类**（抽函数段，注入假 `req` / `fs` 真跑）：
 
@@ -476,7 +532,7 @@ node test/fence.test.mjs --path ~/.dsh/profiles/web/node_modules/dsh-whale-widge
 - **本仓库不包含上游的任何代码或素材。** 仓库里只有 `patch.mjs`、`test/fence.test.mjs`、文档和许可文件。补丁以字符串常量的形式描述"把哪两段改成什么"，不复制上游文件。
 - 上游 `dsh-whale-widget` 的**代码**（`lib/`、`cordis.patch.yml`、`package.json`、文档）是 MIT。
 - 上游的 **`assets/**`（约 6.6MB 图片 / 动图 / 音效）和 `icon.png` 不在 MIT 覆盖范围内**。上游 `PROVENANCE.md` 写明它们"仅授权随本插件运行使用，不授予再许可"。因此本仓库不重新分发它们 —— 补丁只改用户已安装副本里的 `lib/index.js`，素材仍由那份副本提供。
-- 本补丁只改 `lib/index.js`，共 **24 个锚点**：栅栏三处（净增 24 行）、音效查表一处（净增 13 行）、body 超限十处（净增 21 行）、方法守卫三处（净增 18 行）、节假日两处（净增 32 行）、损坏备份五处（净增 41 行）。
+- 本补丁只改 `lib/index.js`，共 **28 个锚点**：栅栏三处（净增 24 行）、音效查表一处（净增 13 行）、body 超限十处（净增 21 行）、方法守卫三处（净增 18 行）、节假日两处（净增 32 行）、损坏备份五处（净增 41 行）、waitState 分桶四处（净增 64 行）。
 
 ## 上游状态
 
@@ -553,7 +609,7 @@ cannot get property "connection.authentication" without inject
 ## 已知限制
 
 - 只在 **DSH 0.2.3-alpha.2** 上端到端验证过。0.2.2-rc.2 到 0.2.3-alpha.2 之间的版本没有逐个验证。
-- 补丁按上游 0.4.2 的代码逐字节匹配 24 个锚点。上游一旦改动其中任何一处，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
+- 补丁按上游 0.4.2 的代码逐字节匹配 28 个锚点。上游一旦改动其中任何一处，脚本会失败退出而不是猜位置 —— 这是有意的，但意味着上游发新版后需要人工更新锚点。
 - 半打补丁（24 处只命中一部分）会被显式拒绝，并逐处报告哪一处没打上，不会静默写坏文件。
 - 只处理 `lib/index.js`。如果上游把栅栏逻辑挪到别的文件，补丁不适用。
 - 写请求（POST/PUT/PATCH/DELETE）仍然只允许回环来源，这是上游 0.3.15 起的既有策略（`writeRejection`），本补丁没有放宽。远端管理仍需 `DSHW_ADMIN_HOSTS`。

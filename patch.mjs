@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // dsh-whale-fence-patch —— 给已安装的 dsh-whale-widget 打上游 bug 的补丁。
 //
-// 改 lib/index.js 里的七组（共 24 个锚点）：
+// 改 lib/index.js 里的八组（共 28 个锚点）：
 //   ① connectionFence()           —— 栅栏兼容（DSH >= 0.2.2-rc.2 的 admit）
 //   ② rejected() 的栅栏分派        —— 同上
 //   ③ root.inject 列表             —— 补 connection.authentication，否则 admit 恒抛
@@ -10,6 +10,7 @@
 //   ⑥ 三个 POST-only 路由的方法守卫  —— GET 打进来 405 而不是 400
 //   ⑦ 2027 年节假日 + 覆盖终点下发   —— HOLIDAY_VALLEY 补 29 条，下发 peakHolidaysCoveredThrough
 //   ⑧ 配置文件损坏备份              —— backupCorruptFile + 四个读取函数
+//   ⑨ waitState 跨会话状态污染       —— 按会话分桶 + waitView() 选一个会话上报（子 agent 不再清主会话挂起）
 // 不复制、不分发上游任何代码或素材；素材仍由用户已安装的上游副本提供。
 //
 // 用法：
@@ -749,6 +750,211 @@ const PATCHED_READ_BUBBLE_CFG = `    function loadBubbleConfig() {
 `
 const MARK_READ_BUBBLE_CFG = `        backupCorruptFile(p, 'bad-json', 'whale-bubble')`
 
+// —— 第九组：waitState 跨会话状态污染（v863）——
+// 上游把挂起状态放在**单个全局对象**里，而 session/event 监听器覆盖所有会话（含子 agent）
+// ⇒ 任何会话的 turn/start、turn/end 都会清掉另一个会话的挂起，sessionName 也被最后说话的会话覆盖。
+// 修法：按会话分桶（Map）+ waitView() 选一个会话上报（有挂起的优先）。
+// 四段锚点：① 状态定义 ② notePendingEvent ③ wait.json 响应体 ④ session/disposed 清理。
+const ORIGINAL_WAITSTATE = `    const waitState = { pending: null, sessionName: "" }
+`
+
+const PATCHED_WAITSTATE = `    // v863（跨会话状态污染修复）：挂起状态**按会话分桶**，不再是一个全局槽位。
+    // 旧实现 \`const waitState = { pending: null, sessionName: "" }\` 是单个对象，而 \`session/event\`
+    // 监听器覆盖**所有会话**（含子 agent）⇒ 任何会话的 \`turn/start\` / \`turn/end\` 都会无条件清掉
+    // 另一个会话的挂起，\`sessionName\` 也被最后说话的那个会话覆盖。用户可见后果：主会话正在等
+    // 用户回答提问（挂件显示"等待输入"气泡），子 agent 一开跑气泡就消失、对话名变成子 agent 的，
+    // 用户以为提问被取消了。
+    // 现在：Map<sid, { pending, sessionName, lastTs }>；\`wait.json\` 再用 waitView() **选一个**会话上报
+    // （挂件只有一个气泡，所以最终仍要选一个，见 waitView 的选法说明）。
+    const waitStates = new Map() // sessionId -> { pending, sessionName, lastTs }
+    const WAIT_STATE_MAX = 200 // 与 subagentSessions 同风格的防御性上限，避免长期运行无限增长
+    let waitActiveSid = '' // 最近一次有事件的会话（只在"没有任何挂起"时用来取 sessionName）
+    function waitBucket(sid) {
+      const key = String(sid || 'default')
+      const hit = waitStates.get(key)
+      if (hit) return hit
+      const st = { pending: null, sessionName: '', lastTs: Date.now() }
+      waitStates.set(key, st)
+      if (waitStates.size > WAIT_STATE_MAX) {
+        // 超限时按 lastTs 淘汰最旧的一半；新条目 lastTs = now（最新），不会被自己淘汰掉
+        const sorted = Array.from(waitStates.entries()).sort((a, b) => (a[1].lastTs || 0) - (b[1].lastTs || 0))
+        for (const [k] of sorted.slice(0, Math.max(1, Math.floor(WAIT_STATE_MAX / 2)))) waitStates.delete(k)
+      }
+      return st
+    }
+    // 选「当前该显示哪个会话」：**有挂起的会话优先**（多个挂起取最近的一条），
+    // 都没有挂起时才回落到最近有事件的会话（只为拿 sessionName）。
+    // ⚠️ 为什么不能只按「最近有事件的会话」选（方案 A 的原始形态）：子 agent 一开跑就成了最近会话，
+    //   主会话的提问气泡照样消失 —— 那正是本次要修的 bug。挂起优先级是修复的必要条件，不是锦上添花。
+    // ⚠️ 为什么子 agent 的挂起**不**按 subagentMuteOn() 静音：那个开关管的是「子智能体**完成**时不提示」，
+    //   属于"已经结束、只是告知"；而挂起是"卡住等用户动手"，静音等于让子 agent 永久挂死且用户毫无信号。
+    //   另外子代理不允许提问（见上方 v761 注释），所以 question 类实际只来自主会话；能走到这里的
+    //   子 agent 挂起只可能是 approval —— 那恰恰是最该让用户看见的一种。
+    function waitView() {
+      let best = null
+      for (const st of waitStates.values()) {
+        if (!st.pending) continue
+        if (!best || (st.pending.ts || 0) > (best.pending.ts || 0)) best = st
+      }
+      if (best) return { pending: best.pending, sessionName: best.sessionName || '' }
+      const act = waitActiveSid ? waitStates.get(waitActiveSid) : null
+      if (act && act.sessionName) return { pending: null, sessionName: act.sessionName }
+      // 活跃会话还没拿到名字：回落到最近一个有名字的会话（保持旧行为 —— 名字不会突然变空）
+      let named = null
+      for (const st of waitStates.values()) {
+        if (!st.sessionName) continue
+        if (!named || (st.lastTs || 0) > (named.lastTs || 0)) named = st
+      }
+      return { pending: null, sessionName: (named && named.sessionName) || '' }
+    }
+`
+
+const ORIGINAL_NOTEPENDING = `function notePendingEvent(sid, event, session) {
+      try {
+        const type = String((event && event.type) || '')
+        const data = (event && event.data) || {}
+        const now = Date.now()
+        // v761：**对话名**有两个来源 —— ① \`session/title\` 事件（DSH 会话标题本身就是一条日志事件：
+        //   \`session.append("session/title", { title, messageSeqs, source })\`，投影键 title 由它折叠而来；
+        //   本插件已监听 session/event ⇒ 直接取 event.data.title，不需要任何新服务）；
+        //   ② \`session\` 对象上的 name/title 等字段（不同 DSH 版本可能有、也可能没有）。
+        //   ⚠️ 必须放在 type/data 声明**之后** —— 放前面会撞 const 的暂时性死区（TDZ），
+        //   抛 ReferenceError 后被外层 try/catch 静默吞掉 ⇒ 整个挂起跟踪失效（本批真踩过）。
+        if (type === 'session/title') {
+          const ti = String(data.title == null ? '' : data.title).trim()
+          if (ti) waitState.sessionName = ti.slice(0, 120)
+          return
+        }
+        // 三个来源，按可靠性排序：① sessionTitle 服务（可折叠日志，含启动前的标题）
+        // ② session/title 事件（启动后新增/更新）③ session 对象字段（版本相关，兜底）
+        const svcName = titleFromService(session)
+        if (svcName) waitState.sessionName = svcName
+        else {
+          const name = pickSessionName(session)
+          if (name) waitState.sessionName = name
+        }
+        if (type === 'tool/call' && String(data.name || data.toolName || '') === WAIT_QUESTION_TOOL) {
+          waitState.pending = { kind: 'question', id: eventCallId(event) || ('q' + now), ts: now, session: sid }
+          return
+        }
+        if (type === 'tool/result') {
+          if (waitState.pending && waitState.pending.kind === 'question') {
+            const cid = eventCallId(event)
+            if (!cid || cid === waitState.pending.id) waitState.pending = null
+          }
+          return
+        }
+        if (type === 'approval/asked') {
+          waitState.pending = { kind: 'approval', id: String(data.id || ('a' + now)), ts: now, session: sid }
+          return
+        }
+        if (type.indexOf('approval/') === 0) {
+          if (waitState.pending && waitState.pending.kind === 'approval') {
+            const id2 = String(data.id || '')
+            if (!id2 || id2 === waitState.pending.id) waitState.pending = null
+          }
+          return
+        }
+        if (type === 'turn/end' || type === 'turn/start') waitState.pending = null
+      } catch (err) {}
+    }
+`
+
+const PATCHED_NOTEPENDING = `function notePendingEvent(sid, event, session) {
+      try {
+        const type = String((event && event.type) || '')
+        const data = (event && event.data) || {}
+        const now = Date.now()
+        // v863：所有读写都落到**本会话自己的桶**上 —— 这是修掉跨会话污染的关键。
+        // 旧实现直接写全局 waitState ⇒ 子 agent 的 turn/start 会清掉主会话的挂起。
+        const st = waitBucket(sid)
+        st.lastTs = now
+        waitActiveSid = String(sid || 'default')
+        // v761：**对话名**有两个来源 —— ① \`session/title\` 事件（DSH 会话标题本身就是一条日志事件：
+        //   \`session.append("session/title", { title, messageSeqs, source })\`，投影键 title 由它折叠而来；
+        //   本插件已监听 session/event ⇒ 直接取 event.data.title，不需要任何新服务）；
+        //   ② \`session\` 对象上的 name/title 等字段（不同 DSH 版本可能有、也可能没有）。
+        //   ⚠️ 必须放在 type/data 声明**之后** —— 放前面会撞 const 的暂时性死区（TDZ），
+        //   抛 ReferenceError 后被外层 try/catch 静默吞掉 ⇒ 整个挂起跟踪失效（本批真踩过）。
+        if (type === 'session/title') {
+          const ti = String(data.title == null ? '' : data.title).trim()
+          if (ti) st.sessionName = ti.slice(0, 120)
+          return
+        }
+        // 三个来源，按可靠性排序：① sessionTitle 服务（可折叠日志，含启动前的标题）
+        // ② session/title 事件（启动后新增/更新）③ session 对象字段（版本相关，兜底）
+        const svcName = titleFromService(session)
+        if (svcName) st.sessionName = svcName
+        else {
+          const name = pickSessionName(session)
+          if (name) st.sessionName = name
+        }
+        if (type === 'tool/call' && String(data.name || data.toolName || '') === WAIT_QUESTION_TOOL) {
+          st.pending = { kind: 'question', id: eventCallId(event) || ('q' + now), ts: now, session: sid }
+          return
+        }
+        if (type === 'tool/result') {
+          if (st.pending && st.pending.kind === 'question') {
+            const cid = eventCallId(event)
+            if (!cid || cid === st.pending.id) st.pending = null
+          }
+          return
+        }
+        if (type === 'approval/asked') {
+          st.pending = { kind: 'approval', id: String(data.id || ('a' + now)), ts: now, session: sid }
+          return
+        }
+        if (type.indexOf('approval/') === 0) {
+          if (st.pending && st.pending.kind === 'approval') {
+            const id2 = String(data.id || '')
+            if (!id2 || id2 === st.pending.id) st.pending = null
+          }
+          return
+        }
+        // v863：只清**本会话**的挂起（旧实现无条件清全局槽位）
+        if (type === 'turn/end' || type === 'turn/start') st.pending = null
+      } catch (err) {}
+    }
+`
+
+const ORIGINAL_WAITROUTE = `        res.writeHead(200, JSON_HEADERS)
+        res.end(JSON.stringify({
+          ok: true,
+          pending: waitState.pending,
+          sessionName: waitState.sessionName || '',
+        }))
+`
+
+const PATCHED_WAITROUTE = `        // v863：状态已按会话分桶，这里用 waitView() **选一个**会话上报（挂件只有一个气泡）。
+        //   返回结构保持 { ok, pending, sessionName } 不变 —— 前端 assets/whale-widget.js 只读
+        //   这两个字段（pollWaitState），不认 session 字段，所以不需要改前端。
+        const view = waitView()
+        res.writeHead(200, JSON_HEADERS)
+        res.end(JSON.stringify({
+          ok: true,
+          pending: view.pending,
+          sessionName: view.sessionName || '',
+        }))
+`
+
+const ORIGINAL_DISPOSED = `    disposers.push(ctx.on('session/disposed', (session) => {
+      if (session && session.id) turnAggs.delete(session.id)
+    }))
+`
+
+// 注意：`from` 不含上面那行注释（它在原文里已存在），所以 `to` 也不能重复它
+const PATCHED_DISPOSED = `    disposers.push(ctx.on('session/disposed', (session) => {
+      if (session && session.id) {
+        turnAggs.delete(session.id)
+        // v863：挂起状态也按会话分桶了 ⇒ 同样要清，否则长期运行会攒下已销毁会话的条目
+        const gone = String(session.id)
+        waitStates.delete(gone)
+        if (waitActiveSid === gone) waitActiveSid = ''
+      }
+    }))
+`
+
+
 // —— 新增锚点表 ——
 // 每一项：{ name, from, to, mark, hints }
 //   from  上游原版里必须恰好出现 1 次的代码块
@@ -855,7 +1061,27 @@ const NEW_ANCHORS = [
     name: '配置损坏备份：loadBubbleConfig',
     from: ORIGINAL_READ_BUBBLE_CFG, to: PATCHED_READ_BUBBLE_CFG, mark: MARK_READ_BUBBLE_CFG,
     hints: ['function loadBubbleConfig()', 'BUBBLE_FILE_CANDIDATES'],
+  },  {
+    name: 'waitState 按会话分桶（定义）',
+    from: ORIGINAL_WAITSTATE, to: PATCHED_WAITSTATE, mark: 'const waitStates = new Map()',
+    hints: ['const waitState = { pending: null, sessionName: "" }', 'waitState', 'notePendingEvent'],
   },
+  {
+    name: 'waitState 按会话分桶（notePendingEvent）',
+    from: ORIGINAL_NOTEPENDING, to: PATCHED_NOTEPENDING, mark: 'const st = waitBucket(sid)',
+    hints: ['function notePendingEvent(sid, event, session)', 'waitState.pending = null', 'waitState.sessionName'],
+  },
+  {
+    name: 'wait.json 返回当前活跃会话',
+    from: ORIGINAL_WAITROUTE, to: PATCHED_WAITROUTE, mark: 'const view = waitView()',
+    hints: ["path: '/dsh-whale/wait.json'", 'pending: waitState.pending', 'sessionName: waitState.sessionName'],
+  },
+  {
+    name: 'session/disposed 清理挂起桶',
+    from: ORIGINAL_DISPOSED, to: PATCHED_DISPOSED, mark: 'waitStates.delete(gone)',
+    hints: ["ctx.on('session/disposed'", 'turnAggs.delete(session.id)', 'session/disposed'],
+  },
+
 ]
 
 // —— 参数 ——

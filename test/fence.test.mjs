@@ -717,3 +717,196 @@ test('四个读取函数不再有空的 catch (err) {} 吞掉解析错误', () =
     assert.ok(!/catch \(err\) \{\}/.test(seg), `${fn} 里仍有空 catch，坏文件会被静默覆盖`)
   }
 })
+
+// ===== 第八组：waitState 跨会话状态污染（v863）=====
+// 上游把挂起状态放在单个全局对象里，而 session/event 监听器覆盖所有会话（含子 agent）
+// ⇒ 子 agent 的 turn/start 会清掉主会话的挂起、并覆盖 sessionName。
+// 这里从**打过补丁的源码**里抽出真实函数跑行为断言（不另写一份"应该长这样"）。
+
+// 注释/字符串感知的抽段（现有 extractFn 不跳过注释，而 waitState 的注释里有成对花括号）
+function extractFnSafe(source, name) {
+  const start = source.indexOf('function ' + name + '(')
+  if (start < 0) throw new Error(`找不到函数 ${name}`)
+  const open = source.indexOf('{', start)
+  let depth = 0, inStr = null, inLine = false, inBlock = false
+  for (let i = open; i < source.length; i++) {
+    const c = source[i], n = source[i + 1]
+    if (inLine) { if (c === '\n') inLine = false; continue }
+    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; i++ } continue }
+    if (inStr) { if (c === '\\') { i++; continue } if (c === inStr) inStr = null; continue }
+    if (c === '/' && n === '/') { inLine = true; i++; continue }
+    if (c === '/' && n === '*') { inBlock = true; i++; continue }
+    if (c === '"' || c === "'" || c === '`') { inStr = c; continue }
+    if (c === '{') depth++
+    else if (c === '}') { depth--; if (depth === 0) return source.slice(start, i + 1) }
+  }
+  throw new Error(`花括号不配平：${name}`)
+}
+
+// 从 `at` 处第一个 `{` 起配平，返回整段（含花括号）
+function blockAt(source, at) {
+  const open = source.indexOf('{', at)
+  let depth = 0, inStr = null, inLine = false, inBlock = false
+  for (let i = open; i < source.length; i++) {
+    const c = source[i], n = source[i + 1]
+    if (inLine) { if (c === '\n') inLine = false; continue }
+    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; i++ } continue }
+    if (inStr) { if (c === '\\') { i++; continue } if (c === inStr) inStr = null; continue }
+    if (c === '/' && n === '/') { inLine = true; i++; continue }
+    if (c === '/' && n === '*') { inBlock = true; i++; continue }
+    if (c === '"' || c === "'" || c === '`') { inStr = c; continue }
+    if (c === '{') depth++
+    else if (c === '}') { depth--; if (depth === 0) return source.slice(open, i + 1) }
+  }
+  throw new Error('花括号不配平')
+}
+
+// 补丁是否在位
+if (!src.includes('const waitStates = new Map()')) {
+  console.error(`${targetFile} 里没有 waitStates 分桶 —— waitState 补丁未应用，先跑 node patch.mjs。`)
+  process.exit(1)
+}
+
+const WAIT_DECL_STATES = src.match(/^ {4}const waitStates = new Map\(\).*$/m)[0]
+const WAIT_DECL_MAX = src.match(/^ {4}const WAIT_STATE_MAX = \d+.*$/m)[0]
+const WAIT_DECL_ACTIVE = src.match(/^ {4}let waitActiveSid = ''.*$/m)[0]
+const WAIT_DECL_TOOL = src.match(/^ {4}const WAIT_QUESTION_TOOL = .*$/m)[0]
+const WAIT_FNS = ['waitBucket', 'waitView', 'titleFromService', 'pickSessionName', 'eventCallId', 'notePendingEvent']
+  .map((n) => extractFnSafe(src, n)).join('\n\n')
+
+const waitRouteAt = src.indexOf("path: '/dsh-whale/wait.json'")
+assert.ok(waitRouteAt >= 0, '找不到 wait.json 路由')
+const waitHandlerAt = src.indexOf('handler: (req, res) =>', waitRouteAt)
+assert.ok(waitHandlerAt >= 0, '找不到 wait.json handler')
+const WAIT_HANDLER = 'const waitJsonHandler = (req, res) => ' + blockAt(src, waitHandlerAt)
+
+const waitDisposedAt = src.indexOf("ctx.on('session/disposed'")
+assert.ok(waitDisposedAt >= 0, '找不到 session/disposed 监听器')
+const WAIT_DISPOSED = 'const disposedHandler = (session) => ' + blockAt(src, src.indexOf('(session) =>', waitDisposedAt))
+
+function buildWaitHarness(opts) {
+  const o = opts || {}
+  const factory = new Function('ctx', 'turnAggs', 'JSON_HEADERS', `
+${WAIT_DECL_STATES}
+${WAIT_DECL_MAX}
+${WAIT_DECL_ACTIVE}
+${WAIT_DECL_TOOL}
+${WAIT_FNS}
+${WAIT_HANDLER}
+${WAIT_DISPOSED}
+return {
+  notePendingEvent, waitView, waitStates,
+  getActiveSid: () => waitActiveSid,
+  waitJsonHandler, disposedHandler,
+}
+`)
+  return factory(
+    { get: (k) => (k === 'sessionTitle' ? (o.titleService || null) : null) },
+    new Map(),
+    { 'content-type': 'application/json' },
+  )
+}
+
+const wSess = (id, name) => ({ id, name })
+const wQuestion = (callId) => ({ type: 'tool/call', data: { name: 'ask_user_question', callId } })
+const wTurnStart = () => ({ type: 'turn/start', data: {} })
+const wTurnEnd = () => ({ type: 'turn/end', data: {} })
+function wJson(h) {
+  let out = ''
+  h.waitJsonHandler({}, { writeHead: () => {}, end: (s) => { out = s } })
+  return JSON.parse(out)
+}
+
+test('waitState：子 agent 的 turn/start 不清主会话的挂起（本次修复的核心）', () => {
+  const h = buildWaitHarness()
+  h.notePendingEvent('main', wQuestion('q1'), wSess('main', '主会话'))
+  assert.equal(wJson(h).pending.id, 'q1', '提问后应有挂起')
+  h.notePendingEvent('sub', wTurnStart(), wSess('sub', '子agent'))
+  const j = wJson(h)
+  assert.equal(j.pending && j.pending.id, 'q1', '子 agent turn/start 后主会话的挂起必须仍在')
+  assert.equal(j.pending.session, 'main', '挂起归属仍是 main')
+  assert.equal(j.sessionName, '主会话', 'sessionName 不能被 sub 覆盖')
+})
+
+test('waitState：会话自己的 turn/end 清自己的挂起，不影响别的会话', () => {
+  const h = buildWaitHarness()
+  h.notePendingEvent('main', wQuestion('q1'), wSess('main', '主会话'))
+  h.notePendingEvent('sub', wQuestion('q2'), wSess('sub', '子agent'))
+  h.notePendingEvent('main', wTurnEnd(), wSess('main', '主会话'))
+  const j = wJson(h)
+  assert.equal(j.pending && j.pending.id, 'q2', 'main 清掉后应回落到 sub 的挂起')
+  assert.equal(j.sessionName, '子agent', 'sessionName 跟随被选中的会话')
+})
+
+test('waitState：多个挂起时取最近的一条', () => {
+  const h = buildWaitHarness()
+  h.notePendingEvent('main', { type: 'approval/asked', data: { id: 'a1' } }, wSess('main', '主会话'))
+  const t0 = Date.now()
+  while (Date.now() <= t0) { /* 保证 ts 严格递增 */ }
+  h.notePendingEvent('sub', wQuestion('q2'), wSess('sub', '子agent'))
+  assert.equal(wJson(h).pending.id, 'q2', '应返回最近的一条挂起')
+})
+
+test('waitState：session/disposed 清理对应条目，activeSid 复位', () => {
+  const h = buildWaitHarness()
+  h.notePendingEvent('main', wQuestion('q1'), wSess('main', '主会话'))
+  h.notePendingEvent('sub', wTurnStart(), wSess('sub', '子agent'))
+  assert.equal(h.waitStates.size, 2)
+  h.disposedHandler({ id: 'sub' })
+  assert.equal(h.waitStates.has('sub'), false, 'sub 的桶应被删除')
+  assert.equal(h.waitStates.has('main'), true, 'main 的桶应保留')
+  assert.equal(wJson(h).pending.id, 'q1', '主会话挂起不受影响')
+  h.disposedHandler({ id: 'main' })
+  assert.equal(h.getActiveSid(), '', 'activeSid 应复位')
+  assert.equal(h.waitStates.size, 0, '桶应全部清空')
+})
+
+test('waitState：sessionName 按会话隔离，互不覆盖', () => {
+  const h = buildWaitHarness()
+  h.notePendingEvent('main', wTurnStart(), wSess('main', '主会话'))
+  h.notePendingEvent('sub', wTurnStart(), wSess('sub', '子agent'))
+  assert.equal(wJson(h).sessionName, '子agent', '无挂起时跟随最近活跃会话')
+  h.notePendingEvent('main', wQuestion('q1'), wSess('main', '主会话'))
+  assert.equal(wJson(h).sessionName, '主会话', '主会话提问后名字回到主会话')
+  h.notePendingEvent('sub', wTurnEnd(), wSess('sub', '子agent'))
+  assert.equal(wJson(h).sessionName, '主会话', 'sub 的 turn/end 不能覆盖名字')
+  assert.equal(h.waitStates.get('sub').sessionName, '子agent', 'sub 自己的桶里仍是自己的名字')
+})
+
+test('waitState：session/title 事件按会话落桶', () => {
+  const h = buildWaitHarness()
+  h.notePendingEvent('main', { type: 'session/title', data: { title: '重构挂起状态' } }, wSess('main', ''))
+  h.notePendingEvent('sub', { type: 'session/title', data: { title: '子任务标题' } }, wSess('sub', ''))
+  assert.equal(h.waitStates.get('main').sessionName, '重构挂起状态')
+  assert.equal(h.waitStates.get('sub').sessionName, '子任务标题')
+})
+
+test('waitState：wait.json 返回结构保持 { ok, pending, sessionName }', () => {
+  const h = buildWaitHarness()
+  const empty = wJson(h)
+  assert.deepEqual(Object.keys(empty).sort(), ['ok', 'pending', 'sessionName'])
+  assert.equal(empty.ok, true)
+  assert.equal(empty.pending, null)
+  assert.equal(empty.sessionName, '')
+  h.notePendingEvent('main', wQuestion('q1'), wSess('main', '主会话'))
+  const full = wJson(h)
+  assert.deepEqual(Object.keys(full).sort(), ['ok', 'pending', 'sessionName'])
+  assert.equal(typeof full.pending.kind, 'string', 'pending.kind 必须存在（前端据此判类型）')
+  assert.equal(typeof full.pending.id, 'string', 'pending.id 必须存在（前端据此去重）')
+})
+
+test('waitState：桶数量有上限，超限淘汰最旧的', () => {
+  const h = buildWaitHarness()
+  for (let i = 0; i < 260; i++) h.notePendingEvent('s' + i, wTurnStart(), wSess('s' + i, 'n' + i))
+  assert.ok(h.waitStates.size <= 200, `桶数应 <= 200，实际 ${h.waitStates.size}`)
+  assert.equal(h.waitStates.has('s259'), true, '最新会话应保留')
+  assert.equal(h.waitStates.has('s0'), false, '最旧会话应被淘汰')
+})
+
+test('waitState：源码里不再有全局单槽 waitState 对象', () => {
+  // 行首锚定：注释里引用旧代码（`// 旧实现 \`const waitState = ...\``）不算
+  assert.ok(!/^ {4}const waitState = \{ pending: null, sessionName: "" \}$/m.test(src),
+    '全局单槽 waitState 定义应已被替换')
+  assert.ok(!/waitState\.pending = /.test(src), '不应再有对全局 waitState.pending 的写入')
+  assert.ok(!/waitState\.sessionName = /.test(src), '不应再有对全局 waitState.sessionName 的写入')
+})
